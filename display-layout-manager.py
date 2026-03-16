@@ -1785,6 +1785,21 @@ def daemon_main(
 
         app = LayoutMenuBarApp(initial_name)
 
+        # Global hotkey: Ctrl+Option+Cmd+R → reset displays
+        from AppKit import NSEvent
+        _HOTKEY_MASK_FLAGS = 0x40000 | 0x80000 | 0x100000  # Ctrl | Option | Cmd
+        _HOTKEY_R_KEYCODE = 15
+
+        def _global_key_handler(event):
+            if (event.keyCode() == _HOTKEY_R_KEYCODE
+                    and (event.modifierFlags() & _HOTKEY_MASK_FLAGS) == _HOTKEY_MASK_FLAGS):
+                app._on_reset_click(None)
+
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            1 << 10,  # NSEventMaskKeyDown
+            _global_key_handler,
+        )
+
     def safe_apply() -> None:
         if not apply_lock.acquire(blocking=False):
             _log("Layout apply already in progress — skipping")
@@ -1851,18 +1866,28 @@ def daemon_main(
     if cg.CGDisplayRegisterReconfigurationCallback(_reconfig_cb, None) != 0:
         _log("Warning: CGDisplayRegisterReconfigurationCallback failed")
 
-    def _shutdown(signum, _frame):
-        _log(f"Signal {signum} received, shutting down")
+    def _cleanup():
+        _log("Shutting down")
         cancel_pending()
         cg.CGDisplayRemoveReconfigurationCallback(_reconfig_cb, None)
-        if _menu_bar_active:
-            import rumps as _rumps
-            _rumps.quit_application()
-        else:
+
+    if _menu_bar_active:
+        from PyObjCTools import MachSignals as _ms
+
+        def _mach_shutdown(signum):
+            _cleanup()
+            rumps.quit_application()
+
+        _ms.signal(signal.SIGTERM, _mach_shutdown)
+        _ms.signal(signal.SIGINT, _mach_shutdown)
+        rumps.events.before_quit.register(_cleanup)
+    else:
+        def _shutdown(signum, _frame):
+            _cleanup()
             cf.CFRunLoopStop(run_loop)
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
 
     _log("Listening for wake and display events")
     if _menu_bar_active:
@@ -1886,6 +1911,37 @@ def _agent_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{_AGENT_LABEL}.plist"
 
 
+def _get_uid() -> str:
+    return str(os.getuid())
+
+
+def _get_agent_pid() -> int | None:
+    """Return the PID of the running LaunchAgent daemon, or None."""
+    result = subprocess.run(
+        ["launchctl", "list", _AGENT_LABEL],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if '"PID"' in line:
+                m = re.search(r"(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    return None
+
+
+def _wait_for_exit(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until *pid* exits. Returns True if it exited, False if still alive."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def install_launch_agent() -> int:
     """Generate, write, and load a macOS LaunchAgent for the daemon."""
     uv_path = shutil.which("uv")
@@ -1900,7 +1956,7 @@ def install_launch_agent() -> int:
         "Label": _AGENT_LABEL,
         "ProgramArguments": [uv_path, "run", "--script", script_path, "daemon"],
         "RunAtLoad": True,
-        "KeepAlive": True,
+        "KeepAlive": {"SuccessfulExit": False},
         "StandardOutPath": _AGENT_LOG,
         "StandardErrorPath": _AGENT_LOG,
         "EnvironmentVariables": {
@@ -1908,22 +1964,26 @@ def install_launch_agent() -> int:
         },
     }
 
+    # Unregister any existing service (running or not)
+    pid = _get_agent_pid()
     subprocess.run(
-        ["launchctl", "unload", str(plist_path)], capture_output=True,
+        ["launchctl", "bootout", f"gui/{_get_uid()}/{_AGENT_LABEL}"],
+        capture_output=True,
     )
+    if pid is not None:
+        _wait_for_exit(pid)
 
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     with open(plist_path, "wb") as f:
         plistlib.dump(plist_data, f)
 
     result = subprocess.run(
-        ["launchctl", "load", str(plist_path)],
-        capture_output=True,
-        text=True,
+        ["launchctl", "bootstrap", f"gui/{_get_uid()}", str(plist_path)],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
         print(
-            f"Error: launchctl load failed: {result.stderr.strip()}",
+            f"Error: launchctl bootstrap failed: {result.stderr.strip()}",
             file=sys.stderr,
         )
         return 1
@@ -1939,58 +1999,70 @@ def install_launch_agent() -> int:
 
 
 def uninstall_launch_agent() -> int:
-    """Unload and remove the macOS LaunchAgent."""
+    """Stop the daemon and remove the macOS LaunchAgent."""
     plist_path = _agent_plist_path()
 
     if not plist_path.exists():
         print(f"LaunchAgent not found: {plist_path}")
         return 1
 
+    # Unregister the service (running or not)
+    pid = _get_agent_pid()
     subprocess.run(
-        ["launchctl", "unload", str(plist_path)], capture_output=True,
+        ["launchctl", "bootout", f"gui/{_get_uid()}/{_AGENT_LABEL}"],
+        capture_output=True,
     )
+    if pid is not None and not _wait_for_exit(pid):
+        os.kill(pid, signal.SIGKILL)
+
     plist_path.unlink()
     print(f"LaunchAgent uninstalled: {plist_path}")
     return 0
 
 
 def stop_launch_agent() -> int:
-    """Stop the daemon but keep the plist (it will restart on next login)."""
-    plist_path = _agent_plist_path()
-
-    if not plist_path.exists():
-        print(f"LaunchAgent not installed: {plist_path}")
+    """Stop the daemon process without unregistering the service."""
+    pid = _get_agent_pid()
+    if pid is None:
+        print("Daemon is not running.")
         return 1
 
-    result = subprocess.run(
-        ["launchctl", "unload", str(plist_path)],
-        capture_output=True, text=True,
+    subprocess.run(
+        ["launchctl", "kill", "SIGTERM", f"gui/{_get_uid()}/{_AGENT_LABEL}"],
+        capture_output=True,
     )
-    if result.returncode != 0:
-        print(f"Error: {result.stderr.strip()}", file=sys.stderr)
-        return 1
 
-    print("Daemon stopped. The plist is still installed and will start on next login.")
-    print(f"To restart now:  {Path(__file__).resolve()} start")
-    print(f"To remove:       {Path(__file__).resolve()} uninstall")
+    if not _wait_for_exit(pid):
+        os.kill(pid, signal.SIGKILL)
+        print("Daemon force-killed.")
+    else:
+        print("Daemon stopped.")
+
+    print(f"To restart:  {Path(__file__).resolve()} start")
+    print(f"To remove:   {Path(__file__).resolve()} uninstall")
     return 0
 
 
 def start_launch_agent() -> int:
-    """Load an already-installed LaunchAgent plist to (re)start the daemon."""
+    """Start the daemon process (service must already be installed)."""
     plist_path = _agent_plist_path()
 
     if not plist_path.exists():
-        print(f"LaunchAgent not installed: {plist_path}", file=sys.stderr)
+        print("LaunchAgent not installed.", file=sys.stderr)
         print(f"Run '{Path(__file__).resolve()} install' first.")
         return 1
 
+    if _get_agent_pid() is not None:
+        print("Daemon is already running.")
+        return 0
+
+    target = f"gui/{_get_uid()}/{_AGENT_LABEL}"
     result = subprocess.run(
-        ["launchctl", "load", str(plist_path)],
+        ["launchctl", "kickstart", target],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        print(f"Error: {result.stderr.strip()}", file=sys.stderr)
+        print(f"Error: launchctl kickstart failed: {result.stderr.strip()}", file=sys.stderr)
         return 1
 
     print("Daemon started.")
@@ -2002,25 +2074,11 @@ def status_launch_agent() -> int:
     """Show whether the LaunchAgent is installed and the daemon is running."""
     plist_path = _agent_plist_path()
     installed = plist_path.exists()
+    pid = _get_agent_pid()
 
     print(f"Plist:     {plist_path}")
     print(f"Installed: {'yes' if installed else 'no'}")
-
-    pid = None
-    running = False
-    result = subprocess.run(
-        ["launchctl", "list", _AGENT_LABEL],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            if '"PID"' in line:
-                m = re.search(r"(\d+)", line)
-                if m:
-                    pid = m.group(1)
-                    running = True
-
-    print(f"Running:   {'yes (PID ' + pid + ')' if running else 'no'}")
+    print(f"Running:   {'yes (PID ' + str(pid) + ')' if pid else 'no'}")
     print(f"Log:       {_AGENT_LOG}")
     return 0
 
@@ -2905,6 +2963,7 @@ def main() -> int:
     sub.add_parser("uninstall", help="stop the daemon and remove the LaunchAgent plist")
     sub.add_parser("start", help="start the daemon via the installed LaunchAgent")
     sub.add_parser("stop", help="stop the daemon (keeps plist; restarts on next login)")
+    sub.add_parser("restart", help="stop and start the daemon via the installed LaunchAgent")
     sub.add_parser("status", help="show whether the LaunchAgent is installed and running")
     sub.add_parser("config", help="interactive display and layout configuration editor")
     sub.add_parser("switch", help="list all layouts and interactively select one to apply")
@@ -2923,6 +2982,21 @@ def main() -> int:
             return start_launch_agent()
         case "stop":
             return stop_launch_agent()
+        case "restart":
+            plist = _agent_plist_path()
+            if not plist.exists():
+                print("LaunchAgent not installed.", file=sys.stderr)
+                return 1
+            target = f"gui/{_get_uid()}/{_AGENT_LABEL}"
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", target],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"Error: {result.stderr.strip()}", file=sys.stderr)
+                return 1
+            print("Daemon restarted.")
+            return 0
         case "status":
             return status_launch_agent()
         case "reset":
