@@ -1165,6 +1165,108 @@ def format_command(args: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _build_reposition_args(
+    layout: Layout,
+    matched: list[MatchedDisplay],
+) -> list[str]:
+    """Build displayplacer args for the reposition phase.
+
+    All displays remain enabled:true.  Target positions get their calculated
+    origins; to-be-disabled displays are placed to the far right so the main
+    display switch and window migration happen before anything is disabled.
+    """
+    label_map: dict[str, MatchedDisplay] = {}
+    for m in matched:
+        label_map[display_label(m, matched)] = m
+
+    main_res, *_ = _resolve_settings(label_map[layout.main])
+    _, main_h = map(int, main_res.split("x"))
+
+    widths: list[int] = []
+    heights: list[int] = []
+    for pos in layout.positions:
+        res, *_ = _resolve_settings(label_map[pos])
+        w, h = map(int, res.split("x"))
+        widths.append(w)
+        heights.append(h)
+
+    main_idx = layout.positions.index(layout.main)
+    origins_x = [0] * len(layout.positions)
+    x = 0
+    for i in range(main_idx - 1, -1, -1):
+        x -= widths[i]
+        origins_x[i] = x
+    x = widths[main_idx]
+    for i in range(main_idx + 1, len(layout.positions)):
+        origins_x[i] = x
+        x += widths[i]
+
+    args: list[str] = []
+    for i, pos in enumerate(layout.positions):
+        m = label_map[pos]
+        res, hz, cd, sc, _en = _resolve_settings(m)
+        y = (main_h - heights[i]) // 2 if pos != layout.main else 0
+        args.append(
+            f"id:{m.display.contextual_id}"
+            f" res:{res}"
+            f" hz:{hz}"
+            f" color_depth:{cd}"
+            f" enabled:true"
+            f" scaling:{sc}"
+            f" origin:({origins_x[i]},{y})"
+            f" degree:0"
+        )
+
+    rightmost_x = (
+        max(origins_x[i] + widths[i] for i in range(len(layout.positions)))
+        if widths else 0
+    )
+    extra_x = rightmost_x
+
+    for dis in layout.disabled:
+        m = label_map.get(dis)
+        if not m or (m.display.enabled == "false" and not m.display.resolution):
+            continue
+        res, hz, cd, sc, _en = _resolve_settings(m)
+        w, h = map(int, res.split("x"))
+        y = (main_h - h) // 2
+        args.append(
+            f"id:{m.display.contextual_id}"
+            f" res:{res}"
+            f" hz:{hz}"
+            f" color_depth:{cd}"
+            f" enabled:true"
+            f" scaling:{sc}"
+            f" origin:({extra_x},{y})"
+            f" degree:0"
+        )
+        extra_x += w
+
+    mentioned = set(layout.positions) | set(layout.disabled)
+    for key, m in label_map.items():
+        if key in mentioned:
+            continue
+        d = m.display
+        if d.enabled == "false":
+            continue
+        res, hz, cd, sc, _en = _resolve_settings(m)
+        w, h = map(int, res.split("x"))
+        y = (main_h - h) // 2
+        args.append(
+            f"id:{d.contextual_id}"
+            f" res:{res}"
+            f" hz:{hz}"
+            f" color_depth:{cd}"
+            f" enabled:true"
+            f" scaling:{sc}"
+            f" origin:({extra_x},{y})"
+            f" degree:0"
+        )
+        extra_x += w
+
+    return args
+
+
 # ---------------------------------------------------------------------------
 # Visual layout (ASCII diagram)
 # ---------------------------------------------------------------------------
@@ -1334,58 +1436,106 @@ def _with_swapped_alternatives(
     return result
 
 
+def _wait_for_stabilization(
+    target_keys: set[str],
+    known_screens: dict[str, KnownScreen],
+    delays: tuple[float, ...] = (1.0, 2.0, 3.0),
+    require_resolution: bool = True,
+) -> tuple[list[MatchedDisplay], set[str]]:
+    """Wait until target displays are active and identifiable.
+
+    Returns (matched, still_missing) where *still_missing* contains the
+    target keys that could not be satisfied after all retries.  Uses a fresh
+    subprocess for the HW info map to avoid stale CGS caches.
+    """
+    matched: list[MatchedDisplay] = []
+    still_missing = set(target_keys)
+    for attempt, delay in enumerate(delays, 1):
+        time.sleep(delay)
+        output = run_displayplacer_list()
+        displays = parse_displays(output)
+        hw_map = build_hw_info_map(fresh=True)
+        matched, _ = match_displays(displays, known_screens, hw_map)
+        if require_resolution:
+            ready_keys = {
+                m.key for m in matched
+                if m.display.resolution and m.display.enabled != "false"
+            }
+        else:
+            ready_keys = {m.key for m in matched}
+        still_missing = target_keys - ready_keys
+        if not still_missing:
+            return matched, set()
+        _log(
+            f"  Waiting for displays ({attempt}/{len(delays)}): "
+            f"{', '.join(sorted(still_missing))} not ready"
+        )
+    return matched, still_missing
+
+
 def _apply_layout(
     layout: Layout,
     matched: list[MatchedDisplay],
     known_screens: dict[str, KnownScreen] | None = None,
 ) -> int:
-    matched_keys = {m.key for m in matched}
-    needed = set(layout.positions) | set(layout.disabled)
-    missing = needed - matched_keys
-    disabled_cg_ids = [
-        int(m.display.contextual_id)
-        for m in matched
-        if m.display.enabled == "false" and not m.display.resolution
-    ]
-    if missing or disabled_cg_ids:
-        all_disabled = _get_disabled_displays()
-        all_disabled_ids = [cg_id for cg_id, *_ in all_disabled]
-        if all_disabled_ids:
-            print(f"Re-enabling {len(all_disabled_ids)} disabled display(s)...")
-            ok = _reenable_displays(all_disabled_ids)
-            if ok and known_screens is not None:
-                for attempt, delay in enumerate((2.0, 3.0, 5.0), 1):
-                    time.sleep(delay)
-                    output = run_displayplacer_list()
-                    displays = parse_displays(output)
-                    hw_map = build_hw_info_map(fresh=True)
-                    matched, _ = match_displays(
-                        displays, known_screens, hw_map,
-                    )
-                    matched_keys = {m.key for m in matched}
-                    still_missing = needed - matched_keys
-                    if not still_missing:
-                        break
-                    print(
-                        f"  Waiting for displays ({attempt}/3): "
-                        f"{', '.join(sorted(still_missing))} not ready"
-                    )
-                if still_missing:
-                    print(
-                        f"Displays re-enabled but not all could be identified: "
-                        f"{', '.join(sorted(still_missing))}",
-                    )
-                    print("Skipping displayplacer — macOS restored the arrangement.")
-                    return 0
-            elif not ok:
-                print("Warning: could not re-enable displays.", file=sys.stderr)
+    needed_by_layout = set(layout.positions) | set(layout.disabled)
+    has_disables = bool(layout.disabled)
 
-    # Verify target displays are fully active before disabling others.
-    # After re-enabling, displays may be "matched" (identified by serial) but
-    # not yet driving output (no resolution).  Proceeding to disable the old
-    # active display while the new one is still initializing can leave all
-    # screens dark.
+    # --- Phase 1: Enable disabled displays needed by this layout -----------
     if known_screens is not None:
+        matched_keys = {m.key for m in matched}
+        missing = needed_by_layout - matched_keys
+        disabled_cg_ids = [
+            int(m.display.contextual_id)
+            for m in matched
+            if m.key in needed_by_layout
+            and (m.display.enabled == "false" or not m.display.resolution)
+        ]
+
+        if missing or disabled_cg_ids:
+            all_disabled = _get_disabled_displays()
+            if missing:
+                ids_to_enable = [cg_id for cg_id, *_ in all_disabled]
+            else:
+                all_disabled_set = {cg_id for cg_id, *_ in all_disabled}
+                ids_to_enable = [
+                    d for d in disabled_cg_ids if d in all_disabled_set
+                ]
+
+            if ids_to_enable:
+                _log(
+                    f"Phase 1: Re-enabling {len(ids_to_enable)} "
+                    f"display(s)..."
+                )
+                ok = _reenable_displays(ids_to_enable)
+                if ok:
+                    matched, still_missing = _wait_for_stabilization(
+                        needed_by_layout, known_screens,
+                        delays=(2.0, 3.0, 5.0),
+                        require_resolution=False,
+                    )
+                    if still_missing:
+                        critical = still_missing & set(layout.positions)
+                        if critical:
+                            _log(
+                                f"Displays re-enabled but critical "
+                                f"displays not identified: "
+                                f"{', '.join(sorted(critical))}"
+                            )
+                            _log(
+                                "Skipping layout — macOS restored "
+                                "the arrangement."
+                            )
+                            return 0
+                        _log(
+                            f"Non-critical displays not identified: "
+                            f"{', '.join(sorted(still_missing))} "
+                            f"— proceeding"
+                        )
+                else:
+                    _log("Warning: could not re-enable displays.")
+
+        # Wait for target displays to be fully active (have resolution)
         target_enabled = set(layout.positions)
         active_keys = {
             m.key for m in matched
@@ -1397,31 +1547,69 @@ def _apply_layout(
                 f"Target displays not yet active: "
                 f"{', '.join(sorted(not_yet_active))} — waiting"
             )
-            for attempt, delay in enumerate((1.0, 2.0, 3.0), 1):
-                time.sleep(delay)
-                output = run_displayplacer_list()
-                fresh_displays = parse_displays(output)
-                hw_map = build_hw_info_map(fresh=True)
-                matched, _ = match_displays(
-                    fresh_displays, known_screens, hw_map,
-                )
-                active_keys = {
-                    m.key for m in matched
-                    if m.display.resolution and m.display.enabled != "false"
-                }
-                not_yet_active = target_enabled - active_keys
-                if not not_yet_active:
-                    break
-                _log(
-                    f"  Waiting for target displays ({attempt}/3): "
-                    f"{', '.join(sorted(not_yet_active))}"
-                )
-            if not_yet_active:
+            matched, still_inactive = _wait_for_stabilization(
+                target_enabled, known_screens,
+                delays=(1.0, 2.0, 3.0),
+                require_resolution=True,
+            )
+            if still_inactive:
                 _log(
                     f"WARNING: target displays still not active: "
-                    f"{', '.join(sorted(not_yet_active))} — proceeding anyway"
+                    f"{', '.join(sorted(still_inactive))} "
+                    f"— proceeding anyway"
                 )
 
+    # --- Phase 2: Reposition -----------------------------------------------
+    if has_disables:
+        reposition_args = _build_reposition_args(layout, matched)
+        print(f"\nLayout: {layout.name}")
+        _log(
+            "Phase 2: Repositioning (all displays enabled, "
+            "to-be-disabled on right)..."
+        )
+        print(format_command(reposition_args))
+        try:
+            result = subprocess.run(
+                ["displayplacer", *reposition_args], check=False,
+            )
+        except FileNotFoundError:
+            print("Error: displayplacer not found.", file=sys.stderr)
+            return 1
+        if result.returncode != 0:
+            return result.returncode
+
+        if known_screens is not None:
+            matched, _ = _wait_for_stabilization(
+                set(layout.positions), known_screens,
+                delays=(1.0, 2.0, 3.0),
+                require_resolution=True,
+            )
+
+        # --- Phase 3: Disable unwanted displays ---------------------------
+        disable_args = build_command(layout, matched)
+        _log("Phase 3: Disabling unwanted displays...")
+        print(format_command(disable_args))
+        try:
+            result = subprocess.run(
+                ["displayplacer", *disable_args], check=False,
+            )
+        except FileNotFoundError:
+            print("Error: displayplacer not found.", file=sys.stderr)
+            return 1
+        if result.returncode != 0:
+            return result.returncode
+
+        if known_screens is not None:
+            _wait_for_stabilization(
+                set(layout.positions), known_screens,
+                delays=(1.0, 2.0),
+                require_resolution=True,
+            )
+
+        print(f"\nLayout applied: {layout.name}")
+        return 0
+
+    # No displays to disable — single displayplacer call is sufficient
     args = build_command(layout, matched)
     print(f"\nLayout: {layout.name}\n")
     print(format_command(args))
@@ -1556,6 +1744,7 @@ def apply_current_layout(
         _log("No matched displays")
         return 1, None
 
+    # Layout lookup uses the active-display signature
     sig = tuple(sorted(m.key for m in matched))
     layouts = device_set_layouts.get(sig, [])
     if not hw_resolved:
@@ -1576,20 +1765,19 @@ def apply_current_layout(
     else:
         layout = layouts[0]
 
-    args = build_command(layout, matched)
+    # Extend with disabled displays so _apply_layout can manage enable/disable
+    disabled_objs = _disabled_display_objects()
+    if disabled_objs:
+        all_displays = displays + disabled_objs
+        matched, _ = match_displays(all_displays, known_screens, hw_map)
+
     _log(f"Applying: {', '.join(labels)} -> {layout.name}")
-
-    try:
-        result = subprocess.run(["displayplacer", *args], check=False)
-    except FileNotFoundError:
-        _log("Error: displayplacer not found")
-        return 1, None
-
-    if result.returncode == 0:
+    rc = _apply_layout(layout, matched, known_screens)
+    if rc == 0:
         _log("Layout applied")
         return 0, layout.name
-    _log(f"displayplacer exited with code {result.returncode}")
-    return result.returncode, None
+    _log(f"Layout application failed with code {rc}")
+    return rc, None
 
 
 # ---------------------------------------------------------------------------
