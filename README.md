@@ -58,6 +58,8 @@ Use subcommands for specific actions:
 - `./display-layout-manager.py switch` — list all layouts and interactively select one to apply
 - `./display-layout-manager.py config` — interactive display and layout configuration editor
 - `./display-layout-manager.py reset` — re-enable all disabled displays
+- `./display-layout-manager.py init` — detect connected displays and generate a new `config.yml`
+- `./display-layout-manager.py daemon` — run as a persistent daemon (see [Daemon mode](#daemon-mode) below)
 
 Run `./display-layout-manager.py -h` to see all available subcommands.
 
@@ -92,7 +94,17 @@ The `match:` block is formatted as valid YAML — copy the fields you need direc
 
 ## Configuration
 
-All displays and layouts are defined in `config.yml` (located next to the script). Copy the included example to get started:
+All displays and layouts are defined in `config.yml` (located next to the script).
+
+### Option A: Auto-generate from connected displays
+
+```bash
+./display-layout-manager.py init
+```
+
+Detects all connected monitors and writes a `config.yml` with pre-filled match fields, current display settings, and a starter layout. If `config.yml` already exists, a timestamped backup is created first.
+
+### Option B: Start from the example template
 
 ```bash
 cp config.example.yml config.yml
@@ -153,6 +165,7 @@ Add an entry to the `displays` list in `config.yml`. Copy the `match` fields fro
 | `settings.fallback_hertz` | no | Alternative refresh rate if the primary isn't available |
 | `settings.color_depth` | no | Color depth (typically `8`). Omit to keep current |
 | `settings.scaling` | no | `true` or `false`. Omit to keep current |
+| `settings.enabled` | no | `true` or `false` (default: `true`). Set `false` to disable this display |
 
 ### Handling identical monitors
 
@@ -205,7 +218,7 @@ Layouts define left-to-right monitor positioning for a given device set. Add ent
 | `name` | yes | Display name shown in output and prompts |
 | `positions` | yes | Display ids in left-to-right physical order |
 | `main` | yes | Which display sits at origin (0,0); others are placed relative to it |
-| `match` | no | Which connected displays trigger this layout for auto/daemon mode. If omitted, the layout is only available via `switch` |
+| `match` | no | Sorted set of display IDs. The layout auto-applies when the connected displays match this set exactly. If omitted, the layout is only available via `switch` |
 | `preferred` | no | `true` to auto-apply when multiple layouts share the same match set (at most one per match set) |
 | `enabled` | no | Which displays should be active. Defaults to `positions` if omitted |
 | `disabled` | no | Display ids to disable for this layout |
@@ -254,6 +267,24 @@ The script can run as a persistent daemon that automatically re-applies the disp
 
 Multiple events in quick succession are debounced — pending timers are cancelled and rescheduled. The daemon uses IOKit power notifications and CoreGraphics display reconfiguration callbacks via `ctypes` — no additional dependencies required.
 
+### Menu bar integration
+
+The daemon can optionally show a macOS menu bar icon for quick layout switching. Enable it in `config.yml`:
+
+```yaml
+options:
+  enable-menu-bar: true
+```
+
+When enabled, the daemon displays a monitor icon in the menu bar with:
+
+- A dropdown listing all defined layouts (checkmark on the active one)
+- A **Reset displays** item to re-enable all disabled displays
+- macOS notifications on layout apply success or failure
+- Global hotkey **Ctrl+Option+Cmd+R** to reset displays from anywhere
+
+The menu bar uses the `rumps` Python package, which is listed in the script's inline dependencies and installed automatically by `uv`.
+
 ### Installing as a LaunchAgent
 
 To have the daemon start automatically on login and restart if it crashes:
@@ -274,6 +305,14 @@ Log output goes to `/tmp/displayplacer-daemon.log`.
 
 Shows whether the plist is installed, the daemon PID if running, and the log path.
 
+### Starting the daemon
+
+```bash
+./display-layout-manager.py start
+```
+
+Starts the daemon via the installed LaunchAgent.
+
 ### Stopping the daemon
 
 ```bash
@@ -281,6 +320,14 @@ Shows whether the plist is installed, the daemon PID if running, and the log pat
 ```
 
 Stops the daemon but keeps the plist installed — it will start again on next login.
+
+### Restarting the daemon
+
+```bash
+./display-layout-manager.py restart
+```
+
+Force-restarts the daemon. Useful after editing `config.yml` while the daemon is running.
 
 ### Removing the LaunchAgent
 
@@ -295,3 +342,47 @@ Stops the daemon and removes the plist entirely.
 ```bash
 tail -f /tmp/displayplacer-daemon.log
 ```
+
+## Command reference
+
+| Command | Description |
+|---|---|
+| *(no command)* | Show ASCII diagram of current display arrangement with detailed info |
+| `init` | Detect connected displays and generate a new `config.yml` |
+| `config` | Interactive display and layout configuration editor |
+| `auto` | Auto-apply the preferred layout for the current display set |
+| `switch` | List all layouts and interactively select one to apply |
+| `reset` | Re-enable all disabled displays |
+| `daemon` | Run as a persistent daemon, re-applying layout on wake and display changes |
+| `install` | Install the LaunchAgent plist and start the daemon |
+| `uninstall` | Stop the daemon and remove the LaunchAgent plist |
+| `start` | Start the daemon via the installed LaunchAgent |
+| `stop` | Stop the daemon (keeps plist installed; restarts on next login) |
+| `restart` | Force restart the daemon via the installed LaunchAgent |
+| `status` | Show whether the LaunchAgent is installed and running |
+
+## Troubleshooting
+
+### displayplacer not found
+
+Install via Homebrew: `brew install displayplacer`. The script checks for it at runtime and exits with an install hint if missing.
+
+### Layout not applying on wake
+
+The daemon retries layout application at 5s, 10s, and 15s after wake to account for macOS display initialization timing. If the layout still doesn't apply, check the log for errors:
+
+```bash
+tail -f /tmp/displayplacer-daemon.log
+```
+
+### Identical monitors are swapped
+
+When two monitors share the same numeric serial (common with same-model pairs), set `edid_serial` on each display entry to distinguish them. Run the script with no arguments to see each display's `match:` block including the EDID serial when available.
+
+### Menu bar icon not showing
+
+Ensure `enable-menu-bar: true` is set in the `options:` section of `config.yml`. The menu bar requires the daemon to be running (`daemon`, `install`, or `start` command).
+
+### Layout takes longer with disabled displays
+
+When a layout disables displays, the script uses a three-phase apply sequence: re-enable needed displays, reposition all displays, then disable unwanted ones. Each phase includes stabilization waits for macOS to finish reconfiguring. This is expected behavior.
