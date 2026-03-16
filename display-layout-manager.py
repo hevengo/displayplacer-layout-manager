@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["ruamel.yaml"]
+# dependencies = ["ruamel.yaml", "rumps"]
 # ///
 
 """Manage display arrangements using displayplacer."""
@@ -96,6 +96,11 @@ class Layout:
 
 
 @dataclass
+class Options:
+    enable_menu_bar: bool = False
+
+
+@dataclass
 class HWInfo:
     """Hardware info extracted from ioreg via CoreDisplay identification chain."""
 
@@ -150,10 +155,10 @@ class ConfigError(SystemExit):
 
 def load_config(
     path: Path,
-) -> tuple[dict[str, KnownScreen], dict[tuple[str, ...], list[Layout]]]:
+) -> tuple[dict[str, KnownScreen], dict[tuple[str, ...], list[Layout]], Options]:
     """Load displays and layouts from a YAML config file.
 
-    Returns (known_screens, device_set_layouts).
+    Returns (known_screens, device_set_layouts, options).
     """
     ry = YAML()
     with open(path) as f:
@@ -161,6 +166,12 @@ def load_config(
 
     if not isinstance(raw, dict):
         raise ConfigError(f"{path} is not a valid YAML mapping")
+
+    # --- options ---
+    raw_options = raw.get("options") or {}
+    options = Options(
+        enable_menu_bar=bool(raw_options.get("enable-menu-bar", False)),
+    )
 
     # --- displays ---
     raw_displays = raw.get("displays", [])
@@ -313,7 +324,7 @@ def load_config(
                 f"match set: {names}"
             )
 
-    return known_screens, device_set_layouts
+    return known_screens, device_set_layouts, options
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1380,48 @@ def _apply_layout(
             elif not ok:
                 print("Warning: could not re-enable displays.", file=sys.stderr)
 
+    # Verify target displays are fully active before disabling others.
+    # After re-enabling, displays may be "matched" (identified by serial) but
+    # not yet driving output (no resolution).  Proceeding to disable the old
+    # active display while the new one is still initializing can leave all
+    # screens dark.
+    if known_screens is not None:
+        target_enabled = set(layout.positions)
+        active_keys = {
+            m.key for m in matched
+            if m.display.resolution and m.display.enabled != "false"
+        }
+        not_yet_active = target_enabled - active_keys
+        if not_yet_active:
+            _log(
+                f"Target displays not yet active: "
+                f"{', '.join(sorted(not_yet_active))} — waiting"
+            )
+            for attempt, delay in enumerate((1.0, 2.0, 3.0), 1):
+                time.sleep(delay)
+                output = run_displayplacer_list()
+                fresh_displays = parse_displays(output)
+                hw_map = build_hw_info_map(fresh=True)
+                matched, _ = match_displays(
+                    fresh_displays, known_screens, hw_map,
+                )
+                active_keys = {
+                    m.key for m in matched
+                    if m.display.resolution and m.display.enabled != "false"
+                }
+                not_yet_active = target_enabled - active_keys
+                if not not_yet_active:
+                    break
+                _log(
+                    f"  Waiting for target displays ({attempt}/3): "
+                    f"{', '.join(sorted(not_yet_active))}"
+                )
+            if not_yet_active:
+                _log(
+                    f"WARNING: target displays still not active: "
+                    f"{', '.join(sorted(not_yet_active))} — proceeding anyway"
+                )
+
     args = build_command(layout, matched)
     print(f"\nLayout: {layout.name}\n")
     print(format_command(args))
@@ -1479,28 +1532,29 @@ def show_displays(
 def apply_current_layout(
     known_screens: dict[str, KnownScreen],
     device_set_layouts: dict[tuple[str, ...], list[Layout]],
-) -> int:
+) -> tuple[int, str | None]:
     """Detect displays, match, and apply the single unambiguous layout.
 
-    Non-interactive — used by the daemon.  Returns 0 on success.
+    Non-interactive -- used by the daemon.
+    Returns (returncode, layout_name) where layout_name is set on success.
     """
     try:
         output = run_displayplacer_list()
     except SystemExit:
         _log("displayplacer not available")
-        return 1
+        return 1, None
 
     displays = parse_displays(output)
     if not displays:
         _log("No displays found")
-        return 1
+        return 1, None
 
     hw_map = build_hw_info_map()
     matched, hw_resolved = match_displays(displays, known_screens, hw_map)
 
     if not matched:
         _log("No matched displays")
-        return 1
+        return 1, None
 
     sig = tuple(sorted(m.key for m in matched))
     layouts = device_set_layouts.get(sig, [])
@@ -1511,13 +1565,13 @@ def apply_current_layout(
 
     if not layouts:
         _log(f"No layout for device set: {', '.join(labels)}")
-        return 1
+        return 1, None
 
     if len(layouts) > 1:
         preferred_lay = next((l for l in layouts if l.preferred), None)
         if not preferred_lay:
             _log(f"Ambiguous layout ({len(layouts)} options, no preferred) — skipping")
-            return 1
+            return 1, None
         layout = preferred_lay
     else:
         layout = layouts[0]
@@ -1529,13 +1583,13 @@ def apply_current_layout(
         result = subprocess.run(["displayplacer", *args], check=False)
     except FileNotFoundError:
         _log("Error: displayplacer not found")
-        return 1
+        return 1, None
 
     if result.returncode == 0:
         _log("Layout applied")
-    else:
-        _log(f"displayplacer exited with code {result.returncode}")
-    return result.returncode
+        return 0, layout.name
+    _log(f"displayplacer exited with code {result.returncode}")
+    return result.returncode, None
 
 
 # ---------------------------------------------------------------------------
@@ -1549,10 +1603,15 @@ _RECONFIG_DELAYS = (2, 5, 10)
 def daemon_main(
     known_screens: dict[str, KnownScreen],
     device_set_layouts: dict[tuple[str, ...], list[Layout]],
+    options: Options,
 ) -> int:
     """Stay resident, re-applying the layout on wake and display changes."""
     _log("Daemon starting — applying layout now")
-    apply_current_layout(known_screens, device_set_layouts)
+    _rc, initial_name = apply_current_layout(known_screens, device_set_layouts)
+
+    if options.enable_menu_bar:
+        import rumps
+        from PyObjCTools import AppHelper
 
     iokit_path = ctypes.util.find_library("IOKit")
     cf_path = ctypes.util.find_library("CoreFoundation")
@@ -1602,6 +1661,7 @@ def daemon_main(
 
     kCFRunLoopDefaultMode = c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
 
+    apply_lock = threading.Lock()
     pending: list[threading.Timer] = []
 
     def cancel_pending() -> None:
@@ -1609,11 +1669,136 @@ def daemon_main(
             t.cancel()
         pending.clear()
 
-    def safe_apply() -> None:
+    # -- Menu bar app (only instantiated when enabled) --
+    _menu_bar_active = options.enable_menu_bar
+    app: object = None
+
+    def _notify(title: str, subtitle: str) -> None:
+        """Send a macOS notification via osascript (works on all macOS versions)."""
         try:
-            apply_current_layout(known_screens, device_set_layouts)
+            script = 'display notification {} with title {}'.format(
+                _applescript_quote(subtitle), _applescript_quote(title),
+            )
+            subprocess.run(["osascript", "-e", script], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _applescript_quote(s: str) -> str:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    if options.enable_menu_bar:
+        _IDLE_TITLE = "\U0001F5A5\uFE0E"
+        _BUSY_TITLE = "\u23F3"
+
+        class LayoutMenuBarApp(rumps.App):
+            def __init__(self, current_layout_name: str | None):
+                super().__init__(
+                    "DisplayPlacer",
+                    title=_IDLE_TITLE,
+                    quit_button="Quit",
+                )
+                self._current_layout_name = current_layout_name
+                self._build_menu()
+
+            def _all_layouts(self) -> list[Layout]:
+                return [lay for group in device_set_layouts.values() for lay in group]
+
+            def _build_menu(self) -> None:
+                self.menu.clear()
+                for lay in self._all_layouts():
+                    item = rumps.MenuItem(lay.name, callback=self._on_layout_click)
+                    if lay.name == self._current_layout_name:
+                        item.state = 1
+                    self.menu.add(item)
+                self.menu.add(rumps.separator)
+                self.menu.add(rumps.MenuItem("Reset displays", callback=self._on_reset_click))
+
+            def schedule_menu_rebuild(self) -> None:
+                """Dispatch _build_menu to the main thread (safe from any thread)."""
+                AppHelper.callAfter(self._build_menu)
+
+            def _finish_operation(self) -> None:
+                """Restore idle title and rebuild menu. Must run on main thread."""
+                self.title = _IDLE_TITLE
+                self._build_menu()
+
+            def _schedule_finish(self) -> None:
+                AppHelper.callAfter(self._finish_operation)
+
+            def _on_layout_click(self, sender):
+                if not apply_lock.acquire(blocking=False):
+                    return
+                layout = next((l for l in self._all_layouts() if l.name == sender.title), None)
+                if not layout:
+                    apply_lock.release()
+                    return
+                self.title = _BUSY_TITLE
+                t = threading.Thread(target=self._do_apply, args=(layout,), daemon=True)
+                t.start()
+
+            def _do_apply(self, layout):
+                try:
+                    displays = parse_displays(run_displayplacer_list())
+                    displays.extend(_disabled_display_objects())
+                    hw_map = build_hw_info_map()
+                    matched, _ = match_displays(displays, known_screens, hw_map)
+                    if matched:
+                        _apply_layout(layout, matched, known_screens)
+                        self._current_layout_name = layout.name
+                        _log(f"Menu: applied {layout.name}")
+                        _notify("Layout applied", layout.name)
+                    else:
+                        _log("Menu: no matched displays")
+                        _notify("Layout failed", "No matched displays")
+                except Exception as exc:
+                    _log(f"Menu: error applying layout: {exc}")
+                    _notify("Layout failed", str(exc))
+                finally:
+                    apply_lock.release()
+                    self._schedule_finish()
+
+            def _on_reset_click(self, sender):
+                if not apply_lock.acquire(blocking=False):
+                    return
+                self.title = _BUSY_TITLE
+                t = threading.Thread(target=self._do_reset, daemon=True)
+                t.start()
+
+            def _do_reset(self):
+                try:
+                    disabled = _get_disabled_displays()
+                    if disabled:
+                        ids = [d for d, *_ in disabled]
+                        _log(f"Menu: re-enabling {len(ids)} display(s)")
+                        _reenable_displays(ids)
+                        _notify("Displays reset", f"Re-enabled {len(ids)} display(s)")
+                    else:
+                        _log("Menu: all displays already active")
+                        _notify("Displays reset", "All displays already active")
+                except Exception as exc:
+                    _log(f"Menu: reset error: {exc}")
+                    _notify("Reset failed", str(exc))
+                finally:
+                    apply_lock.release()
+                    self._schedule_finish()
+
+        app = LayoutMenuBarApp(initial_name)
+
+    def safe_apply() -> None:
+        if not apply_lock.acquire(blocking=False):
+            _log("Layout apply already in progress — skipping")
+            return
+        try:
+            _rc, name = apply_current_layout(known_screens, device_set_layouts)
+            if _menu_bar_active:
+                if name:
+                    app._current_layout_name = name  # type: ignore[union-attr]
+                app.schedule_menu_rebuild()  # type: ignore[union-attr]
         except Exception as exc:
             _log(f"Error: {exc}")
+        finally:
+            apply_lock.release()
 
     root_port = c_uint32()
     notify_port = c_void_p()
@@ -1670,13 +1855,21 @@ def daemon_main(
         _log(f"Signal {signum} received, shutting down")
         cancel_pending()
         cg.CGDisplayRemoveReconfigurationCallback(_reconfig_cb, None)
-        cf.CFRunLoopStop(run_loop)
+        if _menu_bar_active:
+            import rumps as _rumps
+            _rumps.quit_application()
+        else:
+            cf.CFRunLoopStop(run_loop)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
     _log("Listening for wake and display events")
-    cf.CFRunLoopRun()
+    if _menu_bar_active:
+        _log("Menu bar active")
+        app.run()  # type: ignore[union-attr]
+    else:
+        cf.CFRunLoopRun()
     _log("Daemon stopped")
     return 0
 
@@ -2086,7 +2279,7 @@ def setup_main(config_path: Path) -> int:
 
     while True:
         data, ry = _load_raw_config(config_path)
-        known_screens, device_set_layouts = load_config(config_path)
+        known_screens, device_set_layouts, _ = load_config(config_path)
         matched, _hw = match_displays(displays, known_screens, hw_map)
 
         matched_ctx: dict[str, MatchedDisplay] = {}
@@ -2611,7 +2804,7 @@ def reset_main() -> int:
 
 def switch_main(config_path: Path) -> int:
     """Show all defined layouts and let user pick one to apply."""
-    known_screens, device_set_layouts = load_config(config_path)
+    known_screens, device_set_layouts, _ = load_config(config_path)
 
     all_layouts: list[Layout] = [
         lay for group in device_set_layouts.values() for lay in group
@@ -2662,7 +2855,7 @@ def switch_main(config_path: Path) -> int:
 
 def auto_main(config_path: Path) -> int:
     """Non-interactive layout auto-selection. Exits with error if no unambiguous match."""
-    known_screens, device_set_layouts = load_config(config_path)
+    known_screens, device_set_layouts, _ = load_config(config_path)
     output = run_displayplacer_list()
     displays = parse_displays(output)
     hw_map = build_hw_info_map()
@@ -2754,10 +2947,10 @@ def main() -> int:
         case "auto":
             return auto_main(_CONFIG_PATH)
         case "daemon":
-            known_screens, device_set_layouts = load_config(_CONFIG_PATH)
-            return daemon_main(known_screens, device_set_layouts)
+            known_screens, device_set_layouts, options = load_config(_CONFIG_PATH)
+            return daemon_main(known_screens, device_set_layouts, options)
         case _:
-            known_screens, _ = load_config(_CONFIG_PATH)
+            known_screens, *_ = load_config(_CONFIG_PATH)
             return show_displays(known_screens)
 
 

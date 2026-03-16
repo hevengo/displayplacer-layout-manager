@@ -14,6 +14,17 @@
 
 
 # -----------------------------------------------------------------------------
+# options: global settings
+#
+#   enable-menu-bar - when true, the daemon shows a macOS menu bar icon
+#                     that lists all layouts for quick switching (default: false)
+# -----------------------------------------------------------------------------
+
+options:
+  enable-menu-bar: false
+
+
+# -----------------------------------------------------------------------------
 # displays: list of known monitors
 #
 # Each entry needs:
