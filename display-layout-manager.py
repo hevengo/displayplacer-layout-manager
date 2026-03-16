@@ -688,12 +688,21 @@ def _query_coredisplay() -> dict[int, str]:
 # ---------------------------------------------------------------------------
 
 
-def _get_disabled_displays() -> list[tuple[int, int, int, int, bool]]:
+def _get_disabled_displays(
+    fresh: bool = False,
+) -> list[tuple[int, int, int, int, bool]]:
     """Return disabled-but-connected displays via the private CGSGetDisplayList API.
 
     Each tuple is (cg_display_id, serial, vendor, model, is_builtin).
     Virtual/phantom displays (vendor=0 AND serial=0) are filtered out.
+
+    When *fresh* is True the query runs in a subprocess to avoid stale
+    CGGetActiveDisplayList caches that accumulate in long-lived processes
+    (e.g. the daemon).
     """
+    if fresh:
+        return _get_disabled_displays_subprocess()
+
     try:
         cg_path = ctypes.util.find_library("CoreGraphics")
         if not cg_path:
@@ -741,7 +750,58 @@ def _get_disabled_displays() -> list[tuple[int, int, int, int, bool]]:
     return result
 
 
-def _disabled_display_objects() -> list[Display]:
+def _get_disabled_displays_subprocess() -> list[tuple[int, int, int, int, bool]]:
+    """Run disabled-display discovery in a fresh subprocess.
+
+    The daemon process may have stale CGGetActiveDisplayList caches after
+    programmatic display configuration changes.  A fresh process sees the
+    actual current state.
+    """
+    import json as _json
+
+    script = (
+        "import ctypes,ctypes.util,json,sys\n"
+        "p=ctypes.util.find_library('CoreGraphics')\n"
+        "if not p:print('[]');sys.exit()\n"
+        "cg=ctypes.cdll.LoadLibrary(p);U=ctypes.c_uint32\n"
+        "cg.CGSGetDisplayList.argtypes="
+        "[U,ctypes.POINTER(U),ctypes.POINTER(U)]\n"
+        "cg.CGSGetDisplayList.restype=ctypes.c_int32\n"
+        "cg.CGGetActiveDisplayList.argtypes="
+        "[U,ctypes.POINTER(U),ctypes.POINTER(U)]\n"
+        "cg.CGGetActiveDisplayList.restype=ctypes.c_int32\n"
+        "a=(U*16)();ac=U(0)\n"
+        "if cg.CGSGetDisplayList(16,a,ctypes.byref(ac))!=0:"
+        "print('[]');sys.exit()\n"
+        "b=(U*16)();bc=U(0)\n"
+        "if cg.CGGetActiveDisplayList(16,b,ctypes.byref(bc))!=0:"
+        "print('[]');sys.exit()\n"
+        "act={b[i] for i in range(bc.value)};r=[]\n"
+        "for i in range(ac.value):\n"
+        " d=a[i]\n"
+        " if d in act:continue\n"
+        " s=cg.CGDisplaySerialNumber(d);v=cg.CGDisplayVendorNumber(d)\n"
+        " m=cg.CGDisplayModelNumber(d);bi=bool(cg.CGDisplayIsBuiltin(d))\n"
+        " if v==0 and s==0:continue\n"
+        " r.append([int(d),int(s),int(v),int(m),bi])\n"
+        "print(json.dumps(r))\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            (d, s, v, m, b)
+            for d, s, v, m, b in _json.loads(result.stdout)
+        ]
+    except Exception:
+        return []
+
+
+def _disabled_display_objects(fresh: bool = False) -> list[Display]:
     """Build Display objects for disabled-but-connected displays.
 
     Uses CGSGetDisplayList (private API) to discover displays that macOS
@@ -750,7 +810,7 @@ def _disabled_display_objects() -> list[Display]:
     can pair them with known_screens.
     """
     result: list[Display] = []
-    for cg_id, serial, _vendor, _model, _builtin in _get_disabled_displays():
+    for cg_id, serial, _vendor, _model, _builtin in _get_disabled_displays(fresh):
         unsigned_serial = serial & 0xFFFFFFFF
         result.append(Display(
             contextual_id=str(cg_id),
@@ -1493,7 +1553,7 @@ def _apply_layout(
         ]
 
         if missing or disabled_cg_ids:
-            all_disabled = _get_disabled_displays()
+            all_disabled = _get_disabled_displays(fresh=True)
             if missing:
                 ids_to_enable = [cg_id for cg_id, *_ in all_disabled]
             else:
@@ -1766,7 +1826,7 @@ def apply_current_layout(
         layout = layouts[0]
 
     # Extend with disabled displays so _apply_layout can manage enable/disable
-    disabled_objs = _disabled_display_objects()
+    disabled_objs = _disabled_display_objects(fresh=True)
     if disabled_objs:
         all_displays = displays + disabled_objs
         matched, _ = match_displays(all_displays, known_screens, hw_map)
@@ -1928,7 +1988,7 @@ def daemon_main(
             def _do_apply(self, layout):
                 try:
                     displays = parse_displays(run_displayplacer_list())
-                    displays.extend(_disabled_display_objects())
+                    displays.extend(_disabled_display_objects(fresh=True))
                     hw_map = build_hw_info_map()
                     matched, _ = match_displays(displays, known_screens, hw_map)
                     if matched:
@@ -1955,7 +2015,7 @@ def daemon_main(
 
             def _do_reset(self):
                 try:
-                    disabled = _get_disabled_displays()
+                    disabled = _get_disabled_displays(fresh=True)
                     if disabled:
                         ids = [d for d, *_ in disabled]
                         _log(f"Menu: re-enabling {len(ids)} display(s)")
