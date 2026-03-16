@@ -1,0 +1,138 @@
+# =============================================================================
+# Display arrangement config for display-layout-manager.py
+#
+# This file defines your known monitors and how they should be arranged.
+# Run 'display-layout-manager.py' (with no flags) to detect displays and apply a layout.
+#
+# TIP: Run 'display-layout-manager.py' with no arguments first — each display prints
+#      a match: block with all available fields that you can copy directly into this file.
+#
+# YAML GOTCHAS:
+#   - Purely numeric values like edid_serial must be quoted: "9876543210123"
+#   - Use true/false for booleans (not on/off — YAML treats bare 'on' as true)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# displays: list of known monitors
+#
+# Each entry needs:
+#   id          - your chosen name, used to reference this display in layouts
+#   label       - human-readable description (for display in output)
+#   match       - how to identify this monitor when connected
+#     serial          - Serial screen id from 'displayplacer list' (always required)
+#     edid_serial     - EDID AlphanumericSerialNumber from ioreg (optional, needed
+#                       only to distinguish identical monitors with the same serial)
+#     brand           - manufacturer name, e.g. "ASUS", "Dell" (or PNP code "AUS")
+#     production_year - year of manufacture from EDID, e.g. 2021
+#     production_week - week of manufacture from EDID (1-53)
+#     product_name    - model name from EDID, e.g. "VG28UQL1A"
+#   settings    - (optional) preferred display mode; omit to keep current values
+#     resolution    - e.g. "2560x1440"
+#     hertz         - preferred refresh rate
+#     fallback_hertz - used if preferred hertz isn't available
+#     color_depth   - e.g. 8
+#     scaling       - true or false
+#     enabled       - true or false (default: true) — set false to disable display
+# -----------------------------------------------------------------------------
+
+displays:
+- id: macbook
+  label: MacBook Pro
+  match:
+    serial: s1234567890
+
+- id: center-32
+  label: ASUS PG32UQ 32"
+  match:
+    serial: s987654
+    brand: ASUS
+    production_year: 2022
+    production_week: 3
+    product_name: ASUS PG32UQ
+  settings:
+    resolution: 2560x1440
+    hertz: 120
+    color_depth: 8
+    scaling: true
+    enabled: true
+
+- id: left-28
+  label: ASUS VG28UQL1A 28" (left)
+  match:
+    serial: s111222333
+    edid_serial: ABCDEF012345
+  settings:
+    resolution: 2304x1296
+    hertz: 100
+    fallback_hertz: 60
+    color_depth: 8
+    scaling: true
+    enabled: true
+
+- id: right-28
+  label: ASUS VG28UQL1A 28" (right)
+  match:
+    serial: s111222333
+    edid_serial: '9876543210123'      # quoted — purely numeric string
+  settings:
+    resolution: 2304x1296
+    hertz: 100
+    fallback_hertz: 60
+    color_depth: 8
+    scaling: true
+    enabled: true
+
+
+# -----------------------------------------------------------------------------
+# layouts: physical arrangements to apply
+#
+# Each layout defines:
+#   match     - (optional) which enabled displays trigger this layout for
+#               auto / daemon; if omitted the layout never auto-matches
+#               (manual selection via switch only)
+#   preferred - (optional) true to auto-apply when multiple layouts share the
+#               same match set; at most one per match set
+#   enabled   - (optional) which displays should be active;
+#               if omitted, defaults to the same set as positions
+#   disabled  - (optional) display ids to set enabled:false for this layout;
+#               allows switching between e.g. 1 active and 3 active monitors
+#   positions - display ids in left-to-right physical order (required)
+#   main      - which display sits at origin (0,0); others are placed relative
+#
+# Simple layouts only need 'positions' + 'main'.  When a layout has disabled
+# displays, add 'match' to make the target device set explicit.
+#
+# At least one display must be in 'positions' (always-enabled safety rule).
+#
+# Example: if only center-32, left-28, right-28 are connected (macbook lid
+# closed), the third layout below is used automatically.
+# -----------------------------------------------------------------------------
+
+layouts:
+- name: 'Full desk: left | center | right | macbook'
+  match: [left-28, center-32, right-28, macbook]
+  preferred: true
+  enabled: [left-28, center-32, right-28, macbook]
+  positions: [left-28, center-32, right-28, macbook]
+  main: center-32
+
+- name: External only (macbook off)
+  match: [left-28, center-32, right-28]
+  enabled: [left-28, center-32, right-28]
+  disabled: [macbook]
+  positions: [left-28, center-32, right-28]
+  main: center-32
+  preferred: true
+
+- name: Right-Only
+  positions: [right-28]
+  main: right-28
+  enabled: [right-28]
+  disabled: [left-28, center-32, macbook]
+
+- name: Center-Only
+  positions: [center-32]
+  main: center-32
+  enabled: [center-32]
+  disabled: [left-28, right-28, macbook]
