@@ -1911,6 +1911,7 @@ def daemon_main(
 
     apply_lock = threading.Lock()
     pending: list[threading.Timer] = []
+    _suppress_reconfig = True
 
     def cancel_pending() -> None:
         for t in pending:
@@ -1944,7 +1945,7 @@ def daemon_main(
                 super().__init__(
                     "DisplayPlacer",
                     title=_IDLE_TITLE,
-                    quit_button="Quit",
+                    quit_button=None,
                 )
                 self._current_layout_name = current_layout_name
                 self._build_menu()
@@ -1961,6 +1962,8 @@ def daemon_main(
                     self.menu.add(item)
                 self.menu.add(rumps.separator)
                 self.menu.add(rumps.MenuItem("Reset displays", callback=self._on_reset_click))
+                self.menu.add(rumps.separator)
+                self.menu.add(rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()))
 
             def schedule_menu_rebuild(self) -> None:
                 """Dispatch _build_menu to the main thread (safe from any thread)."""
@@ -2048,10 +2051,18 @@ def daemon_main(
             _global_key_handler,
         )
 
+    def _unsuppress() -> None:
+        nonlocal _suppress_reconfig
+        _suppress_reconfig = False
+        _log("Reconfig listener re-enabled (suppression lifted)")
+
     def safe_apply() -> None:
+        nonlocal _suppress_reconfig
         if not apply_lock.acquire(blocking=False):
             _log("Layout apply already in progress — skipping")
             return
+        _suppress_reconfig = True
+        cancel_pending()
         try:
             _rc, name = apply_current_layout(known_screens, device_set_layouts)
             if _menu_bar_active:
@@ -2062,6 +2073,9 @@ def daemon_main(
             _log(f"Error: {exc}")
         finally:
             apply_lock.release()
+            t = threading.Timer(5.0, _unsuppress)
+            t.daemon = True
+            t.start()
 
     root_port = c_uint32()
     notify_port = c_void_p()
@@ -2090,6 +2104,8 @@ def daemon_main(
     @_ReconfigCB
     def _reconfig_cb(_display, flags, _user_info):
         if flags & kCGDisplayBeginConfigurationFlag:
+            return
+        if _suppress_reconfig:
             return
         if flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag):
             _log("Display reconfiguration detected — scheduling layout at 2/5/10s")
@@ -2138,6 +2154,9 @@ def daemon_main(
         signal.signal(signal.SIGINT, _shutdown)
 
     _log("Listening for wake and display events")
+    t = threading.Timer(5.0, _unsuppress)
+    t.daemon = True
+    t.start()
     if _menu_bar_active:
         _log("Menu bar active")
         app.run()  # type: ignore[union-attr]
