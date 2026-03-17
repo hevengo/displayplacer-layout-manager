@@ -1214,6 +1214,10 @@ def build_command(layout: Layout, matched: list[MatchedDisplay]) -> list[str]:
     return args
 
 
+def _strip_enabled_flag(args: list[str]) -> list[str]:
+    return [re.sub(r' enabled:(?:true|false)', '', a) for a in args]
+
+
 def format_command(args: list[str]) -> str:
     """Pretty-print a multi-line displayplacer command."""
     if len(args) <= 1:
@@ -1537,12 +1541,13 @@ def _apply_layout(
     layout: Layout,
     matched: list[MatchedDisplay],
     known_screens: dict[str, KnownScreen] | None = None,
+    allow_disable: bool = True,
 ) -> int:
     needed_by_layout = set(layout.positions) | set(layout.disabled)
     has_disables = bool(layout.disabled)
 
     # --- Phase 1: Enable disabled displays needed by this layout -----------
-    if known_screens is not None:
+    if known_screens is not None and allow_disable:
         matched_keys = {m.key for m in matched}
         missing = needed_by_layout - matched_keys
         disabled_cg_ids = [
@@ -1622,12 +1627,14 @@ def _apply_layout(
     # --- Phase 2: Reposition -----------------------------------------------
     if has_disables:
         reposition_args = _build_reposition_args(layout, matched)
+        if not allow_disable:
+            reposition_args = _strip_enabled_flag(reposition_args)
         print(f"\nLayout: {layout.name}")
         _log(
             "Phase 2: Repositioning (all displays enabled, "
             "to-be-disabled on right)..."
         )
-        print(format_command(reposition_args))
+        _log(format_command(reposition_args))
         try:
             result = subprocess.run(
                 ["displayplacer", *reposition_args], check=False,
@@ -1646,33 +1653,36 @@ def _apply_layout(
             )
 
         # --- Phase 3: Disable unwanted displays ---------------------------
-        disable_args = build_command(layout, matched)
-        _log("Phase 3: Disabling unwanted displays...")
-        print(format_command(disable_args))
-        try:
-            result = subprocess.run(
-                ["displayplacer", *disable_args], check=False,
-            )
-        except FileNotFoundError:
-            print("Error: displayplacer not found.", file=sys.stderr)
-            return 1
-        if result.returncode != 0:
-            return result.returncode
+        if allow_disable:
+            disable_args = build_command(layout, matched)
+            _log("Phase 3: Disabling unwanted displays...")
+            _log(format_command(disable_args))
+            try:
+                result = subprocess.run(
+                    ["displayplacer", *disable_args], check=False,
+                )
+            except FileNotFoundError:
+                print("Error: displayplacer not found.", file=sys.stderr)
+                return 1
+            if result.returncode != 0:
+                return result.returncode
 
-        if known_screens is not None:
-            _wait_for_stabilization(
-                set(layout.positions), known_screens,
-                delays=(1.0, 2.0),
-                require_resolution=True,
-            )
+            if known_screens is not None:
+                _wait_for_stabilization(
+                    set(layout.positions), known_screens,
+                    delays=(1.0, 2.0),
+                    require_resolution=True,
+                )
 
         print(f"\nLayout applied: {layout.name}")
         return 0
 
     # No displays to disable — single displayplacer call is sufficient
     args = build_command(layout, matched)
+    if not allow_disable:
+        args = _strip_enabled_flag(args)
     print(f"\nLayout: {layout.name}\n")
-    print(format_command(args))
+    _log(format_command(args))
     print("\nApplying...")
     try:
         result = subprocess.run(["displayplacer", *args], check=False)
@@ -1832,7 +1842,7 @@ def apply_current_layout(
         matched, _ = match_displays(all_displays, known_screens, hw_map)
 
     _log(f"Applying: {', '.join(labels)} -> {layout.name}")
-    rc = _apply_layout(layout, matched, known_screens)
+    rc = _apply_layout(layout, matched, known_screens, allow_disable=False)
     if rc == 0:
         _log("Layout applied")
         return 0, layout.name
