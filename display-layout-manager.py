@@ -96,6 +96,16 @@ class Layout:
 
 
 @dataclass
+class ReenableResult:
+    success: bool
+    method: str
+    attempted_ids: list[int] = field(default_factory=list)
+    failed_stage: str | None = None
+    return_code: int | None = None
+    message: str = ""
+
+
+@dataclass
 class Options:
     enable_menu_bar: bool = False
 
@@ -820,17 +830,52 @@ def _disabled_display_objects(fresh: bool = False) -> list[Display]:
     return result
 
 
-def _reenable_displays(display_ids: list[int]) -> bool:
+def _format_reenable_result(result: ReenableResult) -> str:
+    status = "succeeded" if result.success else "failed"
+    ids = ", ".join(str(i) for i in result.attempted_ids) or "none"
+    parts = [
+        f"re-enable {status}",
+        f"method={result.method}",
+        f"ids={ids}",
+    ]
+    if result.failed_stage:
+        parts.append(f"stage={result.failed_stage}")
+    if result.return_code is not None:
+        parts.append(f"rc={result.return_code}")
+    if result.message:
+        parts.append(result.message)
+    return "; ".join(parts)
+
+
+def _compact_process_output(text: str) -> str:
+    """Return short, de-duplicated subprocess output for logs."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    unique: list[str] = []
+    for line in lines:
+        if line not in unique:
+            unique.append(line)
+    return "\n".join(unique[:3])
+
+
+def _reenable_displays_cgs(display_ids: list[int]) -> ReenableResult:
     """Re-enable the given CGDisplayIDs via a CGS configuration transaction."""
     if not display_ids:
-        return True
+        return ReenableResult(True, "none", [], message="no displays to enable")
     try:
         cg_path = ctypes.util.find_library("CoreGraphics")
         if not cg_path:
-            return False
+            return ReenableResult(
+                False, "cgs", list(display_ids),
+                failed_stage="find_coregraphics",
+                message="CoreGraphics framework not found",
+            )
         cg = ctypes.cdll.LoadLibrary(cg_path)
-    except OSError:
-        return False
+    except OSError as exc:
+        return ReenableResult(
+            False, "cgs", list(display_ids),
+            failed_stage="load_coregraphics",
+            message=str(exc),
+        )
 
     c_uint32 = ctypes.c_uint32
     c_void_p = ctypes.c_void_p
@@ -845,19 +890,90 @@ def _reenable_displays(display_ids: list[int]) -> bool:
     cg.CGCancelDisplayConfiguration.restype = ctypes.c_int32
 
     config = c_void_p()
-    if cg.CGBeginDisplayConfiguration(ctypes.byref(config)) != 0:
-        return False
+    rc = cg.CGBeginDisplayConfiguration(ctypes.byref(config))
+    if rc != 0:
+        return ReenableResult(
+            False, "cgs", list(display_ids),
+            failed_stage="begin_configuration",
+            return_code=int(rc),
+        )
 
     for did in display_ids:
         rc = cg.CGSConfigureDisplayEnabled(config, c_uint32(did), True)
         if rc != 0:
             cg.CGCancelDisplayConfiguration(config)
-            return False
+            return ReenableResult(
+                False, "cgs", list(display_ids),
+                failed_stage=f"enable_display:{did}",
+                return_code=int(rc),
+            )
 
     kCGConfigurePermanently = 2
-    if cg.CGCompleteDisplayConfiguration(config, kCGConfigurePermanently) != 0:
-        return False
-    return True
+    rc = cg.CGCompleteDisplayConfiguration(config, kCGConfigurePermanently)
+    if rc != 0:
+        cg.CGCancelDisplayConfiguration(config)
+        return ReenableResult(
+            False, "cgs", list(display_ids),
+            failed_stage="complete_configuration",
+            return_code=int(rc),
+        )
+    return ReenableResult(
+        True, "cgs", list(display_ids),
+        message="CGS configuration completed",
+    )
+
+
+def _reenable_displays_displayplacer(display_ids: list[int]) -> ReenableResult:
+    """Best-effort fallback using displayplacer enabled:true per display."""
+    if not display_ids:
+        return ReenableResult(True, "none", [], message="no displays to enable")
+
+    for did in display_ids:
+        try:
+            result = subprocess.run(
+                ["displayplacer", f"id:{did} enabled:true"],
+                capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            return ReenableResult(
+                False, "displayplacer", list(display_ids),
+                failed_stage="displayplacer_missing",
+                message="displayplacer not found",
+            )
+        if result.returncode != 0:
+            detail = _compact_process_output(result.stderr or result.stdout)
+            return ReenableResult(
+                False, "displayplacer", list(display_ids),
+                failed_stage=f"enable_display:{did}",
+                return_code=result.returncode,
+                message=detail,
+            )
+
+    return ReenableResult(
+        True, "displayplacer", list(display_ids),
+        message="displayplacer enabled:true completed",
+    )
+
+
+def _reenable_displays(display_ids: list[int]) -> ReenableResult:
+    """Re-enable displays, falling back to displayplacer if CGS fails."""
+    cgs_result = _reenable_displays_cgs(display_ids)
+    if cgs_result.success:
+        return cgs_result
+
+    _log(f"CGS re-enable failed: {_format_reenable_result(cgs_result)}")
+    displayplacer_result = _reenable_displays_displayplacer(display_ids)
+    if displayplacer_result.success:
+        _log(
+            "displayplacer fallback succeeded: "
+            f"{_format_reenable_result(displayplacer_result)}"
+        )
+    else:
+        _log(
+            "displayplacer fallback failed: "
+            f"{_format_reenable_result(displayplacer_result)}"
+        )
+    return displayplacer_result
 
 
 def _query_coredisplay_subprocess() -> dict[int, str]:
@@ -1104,11 +1220,48 @@ def _resolve_settings(m: MatchedDisplay) -> tuple[str, int, int, str, str]:
     return res, hz, cd, sc, en
 
 
+def _matched_label_map(matched: list[MatchedDisplay]) -> dict[str, MatchedDisplay]:
+    return {display_label(m, matched): m for m in matched}
+
+
+def _is_layout_display_active(m: MatchedDisplay) -> bool:
+    return bool(m.display.resolution) and m.display.enabled != "false"
+
+
+def _inactive_layout_positions(
+    layout: Layout,
+    matched: list[MatchedDisplay],
+) -> set[str]:
+    label_map = _matched_label_map(matched)
+    inactive = set(layout.positions) - set(label_map)
+    inactive.update(
+        key for key in layout.positions
+        if key in label_map and not _is_layout_display_active(label_map[key])
+    )
+    if layout.main not in label_map:
+        inactive.add(layout.main)
+    elif not _is_layout_display_active(label_map[layout.main]):
+        inactive.add(layout.main)
+    return inactive
+
+
+def _abort_if_layout_not_ready(
+    layout: Layout,
+    matched: list[MatchedDisplay],
+) -> bool:
+    inactive = _inactive_layout_positions(layout, matched)
+    if not inactive:
+        return False
+    _log(
+        "Cannot apply layout: required display(s) not active: "
+        f"{', '.join(sorted(inactive))}"
+    )
+    return True
+
+
 def build_command(layout: Layout, matched: list[MatchedDisplay]) -> list[str]:
     """Return displayplacer arg strings (one per display, without quotes)."""
-    label_map: dict[str, MatchedDisplay] = {}
-    for m in matched:
-        label_map[display_label(m, matched)] = m
+    label_map = _matched_label_map(matched)
 
     main_res, *_ = _resolve_settings(label_map[layout.main])
     _, main_h = map(int, main_res.split("x"))
@@ -1239,9 +1392,7 @@ def _build_reposition_args(
     origins; to-be-disabled displays are placed to the far right so the main
     display switch and window migration happen before anything is disabled.
     """
-    label_map: dict[str, MatchedDisplay] = {}
-    for m in matched:
-        label_map[display_label(m, matched)] = m
+    label_map = _matched_label_map(matched)
 
     main_res, *_ = _resolve_settings(label_map[layout.main])
     _, main_h = map(int, main_res.split("x"))
@@ -1545,6 +1696,8 @@ def _apply_layout(
 ) -> int:
     needed_by_layout = set(layout.positions) | set(layout.disabled)
     has_disables = bool(layout.disabled)
+    ids_to_enable: list[int] = []
+    reenable_result: ReenableResult | None = None
 
     # --- Phase 1: Enable disabled displays needed by this layout -----------
     if known_screens is not None and allow_disable:
@@ -1572,26 +1725,41 @@ def _apply_layout(
                     f"Phase 1: Re-enabling {len(ids_to_enable)} "
                     f"display(s)..."
                 )
-                ok = _reenable_displays(ids_to_enable)
-                if ok:
+                reenable_result = _reenable_displays(ids_to_enable)
+                if reenable_result.success:
+                    _log(_format_reenable_result(reenable_result))
                     matched, still_missing = _wait_for_stabilization(
                         needed_by_layout, known_screens,
                         delays=(2.0, 3.0, 5.0),
                         require_resolution=False,
                     )
+                    if (
+                        still_missing
+                        and reenable_result.method == "cgs"
+                    ):
+                        _log(
+                            "CGS accepted re-enable but target displays "
+                            "are still unidentified; trying displayplacer "
+                            "fallback..."
+                        )
+                        fallback = _reenable_displays_displayplacer(ids_to_enable)
+                        _log(_format_reenable_result(fallback))
+                        reenable_result = fallback
+                        if fallback.success:
+                            matched, still_missing = _wait_for_stabilization(
+                                needed_by_layout, known_screens,
+                                delays=(1.0, 2.0, 3.0),
+                                require_resolution=False,
+                            )
                     if still_missing:
                         critical = still_missing & set(layout.positions)
                         if critical:
                             _log(
-                                f"Displays re-enabled but critical "
-                                f"displays not identified: "
+                                f"Cannot apply layout: required display(s) "
+                                f"not identified: "
                                 f"{', '.join(sorted(critical))}"
                             )
-                            _log(
-                                "Skipping layout — macOS restored "
-                                "the arrangement."
-                            )
-                            return 0
+                            return 1
                         _log(
                             f"Non-critical displays not identified: "
                             f"{', '.join(sorted(still_missing))} "
@@ -1617,15 +1785,37 @@ def _apply_layout(
                 delays=(1.0, 2.0, 3.0),
                 require_resolution=True,
             )
+            if (
+                still_inactive
+                and ids_to_enable
+                and reenable_result
+                and reenable_result.success
+                and reenable_result.method == "cgs"
+            ):
+                _log(
+                    "CGS accepted re-enable but target displays are still "
+                    "inactive; trying displayplacer fallback..."
+                )
+                fallback = _reenable_displays_displayplacer(ids_to_enable)
+                _log(_format_reenable_result(fallback))
+                reenable_result = fallback
+                if fallback.success:
+                    matched, still_inactive = _wait_for_stabilization(
+                        target_enabled, known_screens,
+                        delays=(1.0, 2.0, 3.0),
+                        require_resolution=True,
+                    )
             if still_inactive:
                 _log(
-                    f"WARNING: target displays still not active: "
-                    f"{', '.join(sorted(still_inactive))} "
-                    f"— proceeding anyway"
+                    f"Cannot apply layout: required display(s) not active: "
+                    f"{', '.join(sorted(still_inactive))}"
                 )
+                return 1
 
     # --- Phase 2: Reposition -----------------------------------------------
     if has_disables:
+        if _abort_if_layout_not_ready(layout, matched):
+            return 1
         reposition_args = _build_reposition_args(layout, matched)
         if not allow_disable:
             reposition_args = _strip_enabled_flag(reposition_args)
@@ -1654,6 +1844,8 @@ def _apply_layout(
 
         # --- Phase 3: Disable unwanted displays ---------------------------
         if allow_disable:
+            if _abort_if_layout_not_ready(layout, matched):
+                return 1
             disable_args = build_command(layout, matched)
             _log("Phase 3: Disabling unwanted displays...")
             _log(format_command(disable_args))
@@ -1678,6 +1870,8 @@ def _apply_layout(
         return 0
 
     # No displays to disable — single displayplacer call is sufficient
+    if _abort_if_layout_not_ready(layout, matched):
+        return 1
     args = build_command(layout, matched)
     if not allow_disable:
         args = _strip_enabled_flag(args)
@@ -2005,10 +2199,14 @@ def daemon_main(
                     hw_map = build_hw_info_map()
                     matched, _ = match_displays(displays, known_screens, hw_map)
                     if matched:
-                        _apply_layout(layout, matched, known_screens)
-                        self._current_layout_name = layout.name
-                        _log(f"Menu: applied {layout.name}")
-                        _notify("Layout applied", layout.name)
+                        rc = _apply_layout(layout, matched, known_screens)
+                        if rc == 0:
+                            self._current_layout_name = layout.name
+                            _log(f"Menu: applied {layout.name}")
+                            _notify("Layout applied", layout.name)
+                        else:
+                            _log(f"Menu: layout failed with code {rc}")
+                            _notify("Layout failed", layout.name)
                     else:
                         _log("Menu: no matched displays")
                         _notify("Layout failed", "No matched displays")
@@ -2032,8 +2230,18 @@ def daemon_main(
                     if disabled:
                         ids = [d for d, *_ in disabled]
                         _log(f"Menu: re-enabling {len(ids)} display(s)")
-                        _reenable_displays(ids)
-                        _notify("Displays reset", f"Re-enabled {len(ids)} display(s)")
+                        result = _reenable_displays(ids)
+                        _log(f"Menu: {_format_reenable_result(result)}")
+                        if result.success:
+                            _notify(
+                                "Displays reset",
+                                f"Re-enabled {len(ids)} display(s)",
+                            )
+                        else:
+                            _notify(
+                                "Reset failed",
+                                result.message or result.failed_stage or "failed",
+                            )
                     else:
                         _log("Menu: all displays already active")
                         _notify("Displays reset", "All displays already active")
@@ -3124,11 +3332,17 @@ def reset_main() -> int:
     ids = [d for d, *_ in disabled]
     print(f"\nRe-enabling {len(ids)} display(s)...")
 
-    if _reenable_displays(ids):
+    result = _reenable_displays(ids)
+    if result.success:
         print("Done.")
+        print(f"  {_format_reenable_result(result)}")
         return 0
 
-    print("Error: failed to re-enable displays.", file=sys.stderr)
+    print(
+        "Error: failed to re-enable displays: "
+        f"{_format_reenable_result(result)}",
+        file=sys.stderr,
+    )
     return 1
 
 
