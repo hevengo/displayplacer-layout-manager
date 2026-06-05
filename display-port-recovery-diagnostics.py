@@ -454,6 +454,199 @@ def cgs_set_enabled(
     return CgsResult(True, "cgs", list(display_ids), message=f"{action} ({scope})")
 
 
+def cgs_empty_transaction(*, permanent: bool = False) -> CgsResult:
+    """Commit an empty display configuration to make SkyLight rescan state."""
+    cg = _load_coregraphics()
+    if cg is None:
+        return CgsResult(
+            False, "cgs-empty-transaction",
+            failed_stage="load_coregraphics",
+            message="CoreGraphics framework not found",
+        )
+
+    c_void_p = ctypes.c_void_p
+    cg.CGBeginDisplayConfiguration.argtypes = [ctypes.POINTER(c_void_p)]
+    cg.CGBeginDisplayConfiguration.restype = ctypes.c_int32
+    cg.CGCompleteDisplayConfiguration.argtypes = [c_void_p, ctypes.c_uint32]
+    cg.CGCompleteDisplayConfiguration.restype = ctypes.c_int32
+    cg.CGCancelDisplayConfiguration.argtypes = [c_void_p]
+    cg.CGCancelDisplayConfiguration.restype = ctypes.c_int32
+
+    config = c_void_p()
+    rc = int(cg.CGBeginDisplayConfiguration(ctypes.byref(config)))
+    if rc != 0:
+        return CgsResult(
+            False, "cgs-empty-transaction",
+            failed_stage="begin_configuration",
+            return_code=rc,
+        )
+
+    kCGConfigureForSession = 1
+    kCGConfigurePermanently = 2
+    option = kCGConfigurePermanently if permanent else kCGConfigureForSession
+    rc = int(cg.CGCompleteDisplayConfiguration(config, option))
+    if rc != 0:
+        cg.CGCancelDisplayConfiguration(config)
+        return CgsResult(
+            False, "cgs-empty-transaction",
+            failed_stage="complete_configuration",
+            return_code=rc,
+        )
+    scope = "permanent" if permanent else "session"
+    return CgsResult(
+        True, "cgs-empty-transaction",
+        message=f"completed ({scope})",
+    )
+
+
+def _load_skylight() -> Any | None:
+    paths = [
+        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+        ctypes.util.find_library("SkyLight") or "",
+    ]
+    for path in paths:
+        if not path:
+            continue
+        try:
+            return ctypes.CDLL(path)
+        except OSError:
+            continue
+    return None
+
+
+def sls_detect_displays(
+    *,
+    empty_transaction: bool = False,
+    permanent: bool = False,
+) -> CgsResult:
+    """Call SkyLight's private SLSDetectDisplays soft reprobe."""
+    if empty_transaction:
+        txn = cgs_empty_transaction(permanent=permanent)
+        if not txn.success:
+            return txn
+
+    sl = _load_skylight()
+    if sl is None:
+        return CgsResult(
+            False, "sls-detect",
+            failed_stage="load_skylight",
+            message="SkyLight framework not found",
+        )
+    if not hasattr(sl, "SLSDetectDisplays"):
+        return CgsResult(
+            False, "sls-detect",
+            failed_stage="missing_symbol",
+            message="SLSDetectDisplays not found",
+        )
+
+    try:
+        sl.SLSDetectDisplays.argtypes = []
+        sl.SLSDetectDisplays.restype = ctypes.c_int
+        rc = int(sl.SLSDetectDisplays())
+    except Exception as exc:
+        return CgsResult(
+            False, "sls-detect",
+            failed_stage="call",
+            message=str(exc),
+        )
+    if rc != 0:
+        return CgsResult(
+            False, "sls-detect",
+            failed_stage="detect",
+            return_code=rc,
+            message="SLSDetectDisplays returned a non-zero code",
+        )
+    detail = "after empty transaction" if empty_transaction else "soft reprobe"
+    return CgsResult(True, "sls-detect", message=detail)
+
+
+def iokit_request_probe(
+    class_names: list[str],
+    *,
+    probe_option: int = 0,
+) -> CgsResult:
+    """Ask matching IOKit display services to reprobe themselves."""
+    iokit_path = ctypes.util.find_library("IOKit")
+    if not iokit_path:
+        return CgsResult(
+            False, "iokit-probe",
+            failed_stage="find_iokit",
+            message="IOKit framework not found",
+        )
+    try:
+        iokit = ctypes.CDLL(iokit_path)
+    except OSError as exc:
+        return CgsResult(
+            False, "iokit-probe",
+            failed_stage="load_iokit",
+            message=str(exc),
+        )
+
+    io_object_t = ctypes.c_uint32
+    io_iterator_t = ctypes.c_uint32
+    io_service_t = ctypes.c_uint32
+    kern_return_t = ctypes.c_int
+    mach_port_t = ctypes.c_uint32
+
+    iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    iokit.IOServiceMatching.restype = ctypes.c_void_p
+    iokit.IOServiceGetMatchingServices.argtypes = [
+        mach_port_t, ctypes.c_void_p, ctypes.POINTER(io_iterator_t),
+    ]
+    iokit.IOServiceGetMatchingServices.restype = kern_return_t
+    iokit.IOIteratorNext.argtypes = [io_iterator_t]
+    iokit.IOIteratorNext.restype = io_service_t
+    iokit.IOServiceRequestProbe.argtypes = [io_service_t, ctypes.c_uint32]
+    iokit.IOServiceRequestProbe.restype = kern_return_t
+    iokit.IOObjectRelease.argtypes = [io_object_t]
+    iokit.IOObjectRelease.restype = kern_return_t
+
+    probed = 0
+    failures: list[str] = []
+    kIOMainPortDefault = 0
+    for class_name in class_names:
+        matching = iokit.IOServiceMatching(class_name.encode("utf-8"))
+        if not matching:
+            failures.append(f"{class_name}: no matching dictionary")
+            continue
+
+        iterator = io_iterator_t(0)
+        rc = int(iokit.IOServiceGetMatchingServices(
+            kIOMainPortDefault, matching, ctypes.byref(iterator),
+        ))
+        if rc != 0:
+            failures.append(f"{class_name}: match rc=0x{rc:x}")
+            continue
+
+        try:
+            while True:
+                service = int(iokit.IOIteratorNext(iterator))
+                if service == 0:
+                    break
+                try:
+                    rc = int(iokit.IOServiceRequestProbe(
+                        io_service_t(service), ctypes.c_uint32(probe_option),
+                    ))
+                    if rc == 0:
+                        probed += 1
+                    else:
+                        failures.append(f"{class_name}:{service}: probe rc=0x{rc:x}")
+                finally:
+                    iokit.IOObjectRelease(io_object_t(service))
+        finally:
+            iokit.IOObjectRelease(io_object_t(iterator.value))
+
+    message = f"probed {probed} service(s)"
+    if failures:
+        message += "; " + "; ".join(failures[:4])
+    return CgsResult(
+        probed > 0,
+        "iokit-probe",
+        failed_stage=None if probed > 0 else "no_services_probed",
+        message=message,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CoreDisplay and IOKit read-only probing
 # ---------------------------------------------------------------------------
@@ -1129,16 +1322,21 @@ def _print_suggestions(snapshot: Snapshot) -> None:
     if active_ids:
         ids = ", ".join(active_ids)
         print(f"  display ids currently visible to displayplacer: {ids}")
-    print("  1. ./display-port-recovery-diagnostics.py reapply-mode --id 3")
-    print("  2. ./display-port-recovery-diagnostics.py displayplacer-toggle --id 3 --yes")
-    print("  3. ./display-port-recovery-diagnostics.py cgs-toggle --id 3 --yes")
+    print("  1. ./display-port-recovery-diagnostics.py sls-detect")
+    print("  2. ./display-port-recovery-diagnostics.py reapply-mode --id 3")
     print(
-        "  4. ./display-port-recovery-diagnostics.py mode-cycle --id 3 "
+        "  3. ./display-port-recovery-diagnostics.py ddc-dpms-cycle "
+        "--display 'ASUS PG32UQ' --yes"
+    )
+    print("  4. ./display-port-recovery-diagnostics.py sleep-displays --yes")
+    print(
+        "  5. ./display-port-recovery-diagnostics.py mode-cycle --id 3 "
         "--temporary-res 1920x1080 --temporary-hz 60 --yes"
     )
+    print("  6. ./display-port-recovery-diagnostics.py iokit-probe")
     candidates = _rank_usb_recovery_candidates(snapshot.usb_devices)
     if candidates:
-        print("  5. USB reset candidates (match the physical adapter first):")
+        print("  7. USB reset candidates (match the physical adapter first):")
         for usb in candidates[:4]:
             if usb.location_id is None:
                 continue
@@ -1149,6 +1347,7 @@ def _print_suggestions(snapshot: Snapshot) -> None:
                 f"--dry-run    # {label}"
             )
         print("     then repeat the matching command without --dry-run and with --yes")
+    print("  Optional: displaypolicyd-restart --yes")
     print("  Last resort: windowserver-restart --yes (logs out the GUI session)")
 
 
@@ -1207,6 +1406,21 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     else:
         print_snapshot(snapshot)
     return 0
+
+
+def cmd_sls_detect(args: argparse.Namespace) -> int:
+    result = sls_detect_displays(
+        empty_transaction=args.empty_transaction,
+        permanent=args.permanent,
+    )
+    print(result.summary)
+    return 0 if result.success else 1
+
+
+def cmd_iokit_probe(args: argparse.Namespace) -> int:
+    result = iokit_request_probe(args.class_name, probe_option=_parse_uint(args.option))
+    print(result.summary)
+    return 0 if result.success else 1
 
 
 def cmd_cgs_enable(args: argparse.Namespace) -> int:
@@ -1286,11 +1500,58 @@ def cmd_mode_cycle(args: argparse.Namespace) -> int:
 
 
 def cmd_sleep_displays(args: argparse.Namespace) -> int:
-    if not _require_confirmation(args, "pmset displaysleepnow"):
+    if not _require_confirmation(args, "display sleep + wake"):
         return 2
     result = run_command("pmset displaysleepnow", ["pmset", "displaysleepnow"])
     print(result.summary)
+    if not result.ok or args.no_wake:
+        return 0 if result.ok else 1
+    time.sleep(args.seconds)
+    wake = run_command("caffeinate wake", ["caffeinate", "-u", "-t", "1"])
+    print(wake.summary)
+    return 0 if result.ok and wake.ok else 1
+
+
+def cmd_displaypolicyd_restart(args: argparse.Namespace) -> int:
+    if not _require_confirmation(args, "displaypolicyd restart"):
+        return 2
+    result = run_command(
+        "restart displaypolicyd",
+        ["sudo", "killall", "-9", "displaypolicyd"],
+        capture=True,
+        timeout=30,
+    )
+    print(result.summary)
     return 0 if result.ok else 1
+
+
+def cmd_ddc_dpms_cycle(args: argparse.Namespace) -> int:
+    if not _require_confirmation(args, "DDC/CI DPMS cycle"):
+        return 2
+    if not shutil.which("m1ddc"):
+        print("Error: m1ddc not found in PATH.", file=sys.stderr)
+        print("Install m1ddc before trying DDC/CI DPMS recovery.", file=sys.stderr)
+        return 127
+    off = run_command(
+        "m1ddc DPMS off",
+        ["m1ddc", "display", args.display, "set", "0xD6", str(args.off_value)],
+        timeout=20,
+    )
+    print(off.summary)
+    if not off.ok:
+        return 1
+    time.sleep(args.seconds)
+    on = run_command(
+        "m1ddc DPMS on",
+        ["m1ddc", "display", args.display, "set", "0xD6", str(args.on_value)],
+        timeout=20,
+    )
+    print(on.summary)
+    if on.ok and args.detect_after:
+        detect = sls_detect_displays()
+        print(detect.summary)
+        return 0 if detect.success else 1
+    return 0 if on.ok else 1
 
 
 def cmd_windowserver_restart(args: argparse.Namespace) -> int:
@@ -1329,16 +1590,34 @@ def cmd_recover(args: argparse.Namespace) -> int:
         return 2
 
     steps: list[tuple[str, Any]] = [
+        ("sls-detect", lambda: sls_detect_displays()),
+        (
+            "iokit-probe",
+            lambda: iokit_request_probe(["AppleCLCD2", "AppleDisplay"]),
+        ),
         ("displayplacer-enable", lambda: _run_id_enable("displayplacer enable", args.id, True)),
         ("cgs-enable", lambda: cgs_set_enabled([args.id], True, permanent=False)),
         ("reapply-mode", lambda: _recover_reapply(args.id)),
+    ]
+    if args.ddc_dpms:
+        steps.append(
+            (
+                "ddc-dpms-cycle",
+                lambda: _recover_ddc_dpms(args.ddc_display, args.seconds),
+            )
+        )
+    if args.sleep_wake:
+        steps.append(("sleep-displays", lambda: _recover_sleep_wake(args.seconds)))
+    steps.append(
         (
             "mode-cycle",
             lambda: _recover_mode_cycle(
                 args.id, args.temporary_res, args.temporary_hz, args.seconds,
             ),
-        ),
-    ]
+        )
+    )
+    if args.displaypolicyd:
+        steps.append(("displaypolicyd-restart", _recover_displaypolicyd_restart))
     if args.usb_location:
         steps.append(
             (
@@ -1405,6 +1684,50 @@ def _recover_mode_cycle(
     )
 
 
+def _recover_ddc_dpms(display: str, seconds: float) -> CommandResult:
+    if not shutil.which("m1ddc"):
+        return CommandResult("m1ddc DPMS cycle", [], 127, stderr="m1ddc not found")
+    off = run_command(
+        "m1ddc DPMS off",
+        ["m1ddc", "display", display, "set", "0xD6", "4"],
+        timeout=20,
+    )
+    if not off.ok:
+        return off
+    time.sleep(seconds)
+    on = run_command(
+        "m1ddc DPMS on",
+        ["m1ddc", "display", display, "set", "0xD6", "1"],
+        timeout=20,
+    )
+    if not on.ok:
+        return on
+    detect = sls_detect_displays()
+    return CommandResult(
+        "m1ddc DPMS cycle",
+        [],
+        0 if detect.success else 1,
+        stdout=detect.summary,
+    )
+
+
+def _recover_sleep_wake(seconds: float) -> CommandResult:
+    sleep = run_command("pmset displaysleepnow", ["pmset", "displaysleepnow"])
+    if not sleep.ok:
+        return sleep
+    time.sleep(seconds)
+    return run_command("caffeinate wake", ["caffeinate", "-u", "-t", "1"])
+
+
+def _recover_displaypolicyd_restart() -> CommandResult:
+    return run_command(
+        "restart displaypolicyd",
+        ["sudo", "killall", "-9", "displaypolicyd"],
+        capture=True,
+        timeout=30,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1422,6 +1745,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("snapshot", help="read-only display, USB, and Thunderbolt probe")
     p.add_argument("--json", action="store_true", help="print machine-readable JSON")
     p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("sls-detect", help="SkyLight SLSDetectDisplays soft reprobe")
+    p.add_argument(
+        "--empty-transaction",
+        action="store_true",
+        help="commit an empty CG display transaction before detecting",
+    )
+    p.add_argument(
+        "--permanent",
+        action="store_true",
+        help="make the optional empty transaction permanent",
+    )
+    p.set_defaults(func=cmd_sls_detect)
+
+    p = sub.add_parser("iokit-probe", help="IOServiceRequestProbe display services")
+    p.add_argument(
+        "--class-name",
+        action="append",
+        default=["AppleCLCD2", "AppleDisplay"],
+        help="IOService class to probe; repeatable",
+    )
+    p.add_argument(
+        "--option",
+        default="0",
+        help="probe option, decimal or hex; default is kIOFBUserRequestProbe/0",
+    )
+    p.set_defaults(func=cmd_iokit_probe)
 
     p = sub.add_parser("cgs-enable", help="private CGS enabled:true for one display")
     p.add_argument("--id", type=int, required=True, help="contextual CG/displayplacer id")
@@ -1458,9 +1808,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="confirm experimental action")
     p.set_defaults(func=cmd_mode_cycle)
 
-    p = sub.add_parser("sleep-displays", help="ask macOS to sleep displays")
+    p = sub.add_parser("sleep-displays", help="sleep displays, then caffeinate-wake")
+    p.add_argument("--seconds", type=float, default=2.0, help="delay before wake")
+    p.add_argument("--no-wake", action="store_true", help="skip caffeinate wake")
     p.add_argument("--yes", action="store_true", help="confirm experimental action")
     p.set_defaults(func=cmd_sleep_displays)
+
+    p = sub.add_parser("displaypolicyd-restart", help="restart displaypolicyd")
+    p.add_argument("--yes", action="store_true", help="confirm daemon restart")
+    p.set_defaults(func=cmd_displaypolicyd_restart)
+
+    p = sub.add_parser("ddc-dpms-cycle", help="m1ddc VESA DPMS off/on cycle")
+    p.add_argument("--display", default="ASUS PG32UQ", help="m1ddc display selector")
+    p.add_argument("--seconds", type=float, default=2.0, help="delay while DPMS off")
+    p.add_argument("--off-value", type=int, default=4, help="VCP 0xD6 off value")
+    p.add_argument("--on-value", type=int, default=1, help="VCP 0xD6 on value")
+    p.add_argument(
+        "--no-detect-after",
+        dest="detect_after",
+        action="store_false",
+        help="skip SLSDetectDisplays after DPMS on",
+    )
+    p.set_defaults(func=cmd_ddc_dpms_cycle, detect_after=True)
+    p.add_argument("--yes", action="store_true", help="confirm DDC/CI write")
 
     p = sub.add_parser("windowserver-restart", help="restart WindowServer via killall")
     p.add_argument("--yes", action="store_true", help="confirm GUI logout action")
@@ -1488,6 +1858,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temporary-hz", type=int, default=60)
     p.add_argument("--seconds", type=float, default=3.0, help="mode cycle delay")
     p.add_argument("--step-delay", type=float, default=2.0, help="delay after each step")
+    p.add_argument(
+        "--ddc-dpms",
+        action="store_true",
+        help="include m1ddc DPMS off/on cycle",
+    )
+    p.add_argument("--ddc-display", default="ASUS PG32UQ", help="m1ddc display")
+    p.add_argument(
+        "--sleep-wake",
+        action="store_true",
+        help="include pmset displaysleepnow + caffeinate wake",
+    )
+    p.add_argument(
+        "--displaypolicyd",
+        action="store_true",
+        help="include sudo killall -9 displaypolicyd",
+    )
     p.add_argument("--usb-location", help="optional USB locationID to reset")
     p.add_argument(
         "--usb-action",

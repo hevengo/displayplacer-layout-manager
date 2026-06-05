@@ -58,6 +58,7 @@ Use subcommands for specific actions:
 - `./display-layout-manager.py switch` — list all layouts and interactively select one to apply
 - `./display-layout-manager.py config` — interactive display and layout configuration editor
 - `./display-layout-manager.py reset` — re-enable all disabled displays
+- `./display-layout-manager.py detect` — print an init-style `displays:` YAML block without writing files
 - `./display-layout-manager.py init` — detect connected displays and generate a new `config.yml`
 - `./display-layout-manager.py daemon` — run as a persistent daemon (see [Daemon mode](#daemon-mode) below)
 
@@ -247,9 +248,13 @@ The identification chain:
 CGDisplayID (contextual)
   → CoreDisplay_DisplayCreateInfoDictionary()  [private API, ctypes]
     → IODisplayLocation path → dispext index
-      → ioreg AppleCLCD2 DisplayAttributes      [plistlib]
+      → ioreg framebuffer DisplayAttributes     [plistlib]
         → AlphanumericSerialNumber
 ```
+
+On newer macOS versions, framebuffer attributes are commonly exposed under
+`IOMobileFramebufferShim` or `IOMobileFramebuffer`; older systems may expose
+the same data under `AppleCLCD2`. The script tries all three in that order.
 
 See `display-identification-facts.md` for the full technical investigation and caveats.
 

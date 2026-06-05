@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import io
 import os
 import plistlib
 import re
@@ -579,18 +580,15 @@ def extract_apply_command(output: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _query_ioregistry() -> dict[str, HWInfo]:
-    """Map dispext name (e.g. 'dispext0') to HWInfo via ioreg."""
-    try:
-        raw = subprocess.run(
-            ["ioreg", "-r", "-c", "AppleCLCD2", "-d", "1", "-a"],
-            capture_output=True,
-            check=True,
-        ).stdout
-        entries = plistlib.loads(raw)
-    except Exception:
-        return {}
+_IOREG_FRAMEBUFFER_CLASSES = (
+    "IOMobileFramebufferShim",
+    "IOMobileFramebuffer",
+    "AppleCLCD2",
+)
 
+
+def _hw_info_from_ioreg_entries(entries: list[dict]) -> dict[str, HWInfo]:
+    """Map dispext name (e.g. 'dispext0') to HWInfo from ioreg plist entries."""
     result: dict[str, HWInfo] = {}
     for entry in entries:
         name = entry.get("IONameMatched", "")
@@ -608,6 +606,27 @@ def _query_ioregistry() -> dict[str, HWInfo]:
             week_of_manufacture=prod.get("WeekOfManufacture", 0),
         )
     return result
+
+
+def _query_ioregistry() -> dict[str, HWInfo]:
+    """Map dispext name (e.g. 'dispext0') to HWInfo via ioreg."""
+    for class_name in _IOREG_FRAMEBUFFER_CLASSES:
+        try:
+            raw = subprocess.run(
+                ["ioreg", "-r", "-c", class_name, "-d", "1", "-a"],
+                capture_output=True,
+                check=True,
+            ).stdout
+            if not raw:
+                continue
+            entries = plistlib.loads(raw)
+        except Exception:
+            continue
+
+        result = _hw_info_from_ioreg_entries(entries)
+        if result:
+            return result
+    return {}
 
 
 def _query_coredisplay() -> dict[int, str]:
@@ -2667,39 +2686,9 @@ _INIT_LAYOUTS_HEADER = """\
 # -----------------------------------------------------------------------------"""
 
 
-def init_main(config_path: Path) -> int:
-    """Detect connected displays and generate a fresh config.yml."""
-    import io
+def _build_detected_display_entries():
+    """Detect displays and return init-style YAML data plus generated IDs."""
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
-
-    print(
-        "\n"
-        "  This will detect all currently connected displays and generate\n"
-        f"  a new {config_path.name} with:\n"
-        "\n"
-        "    - a display entry for every connected monitor\n"
-        "    - a single layout using all enabled displays\n"
-        "\n"
-        "  You can fine-tune the result afterwards with the 'config' command.\n"
-    )
-
-    if config_path.exists():
-        print(
-            f"  WARNING: {config_path.name} already exists and will be overwritten.\n"
-            "  A timestamped backup will be created first.\n"
-        )
-        if not _confirm("Continue?"):
-            print("  Aborted.")
-            return 1
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = config_path.with_suffix(f".yml.{ts}.bak")
-        shutil.copy2(config_path, backup)
-        print(f"  Backup saved to {backup.name}\n")
-    else:
-        if not _confirm("Continue?"):
-            print("  Aborted.")
-            return 1
-        print()
 
     output = run_displayplacer_list()
     displays = parse_displays(output)
@@ -2707,14 +2696,8 @@ def init_main(config_path: Path) -> int:
     all_displays = displays + disabled
     hw_map = build_hw_info_map()
 
-    if not all_displays:
-        print("No displays detected.", file=sys.stderr)
-        return 1
-
     data = CommentedMap()
     data["displays"] = CommentedSeq()
-    data["layouts"] = CommentedSeq()
-    ry = YAML()
 
     assigned_ids: set[str] = set()
     display_info: list[tuple[Display, str, str]] = []  # (display, id, label)
@@ -2758,6 +2741,68 @@ def init_main(config_path: Path) -> int:
         )
         display_info.append((d, did, label))
 
+    return data, assigned_ids, display_info
+
+
+def _dump_generated_yaml(data) -> str:
+    stream = io.StringIO()
+    ry = YAML()
+    ry.dump(data, stream)
+    return stream.getvalue()
+
+
+def detect_main() -> int:
+    """Detect connected displays and print init-style display YAML."""
+    data, _assigned_ids, display_info = _build_detected_display_entries()
+    if not display_info:
+        print("No displays detected.", file=sys.stderr)
+        return 1
+
+    print(_dump_generated_yaml(data), end="")
+    return 0
+
+
+def init_main(config_path: Path) -> int:
+    """Detect connected displays and generate a fresh config.yml."""
+    from ruamel.yaml.comments import CommentedSeq
+
+    print(
+        "\n"
+        "  This will detect all currently connected displays and generate\n"
+        f"  a new {config_path.name} with:\n"
+        "\n"
+        "    - a display entry for every connected monitor\n"
+        "    - a single layout using all enabled displays\n"
+        "\n"
+        "  You can fine-tune the result afterwards with the 'config' command.\n"
+    )
+
+    if config_path.exists():
+        print(
+            f"  WARNING: {config_path.name} already exists and will be overwritten.\n"
+            "  A timestamped backup will be created first.\n"
+        )
+        if not _confirm("Continue?"):
+            print("  Aborted.")
+            return 1
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = config_path.with_suffix(f".yml.{ts}.bak")
+        shutil.copy2(config_path, backup)
+        print(f"  Backup saved to {backup.name}\n")
+    else:
+        if not _confirm("Continue?"):
+            print("  Aborted.")
+            return 1
+        print()
+
+    data, assigned_ids, display_info = _build_detected_display_entries()
+
+    if not display_info:
+        print("No displays detected.", file=sys.stderr)
+        return 1
+
+    data["layouts"] = CommentedSeq()
+
     enabled_info = [
         (d, did, label) for d, did, label in display_info
         if d.enabled.lower() != "false"
@@ -2789,9 +2834,7 @@ def init_main(config_path: Path) -> int:
         )
 
     # Dump YAML, then insert section-header comments.
-    stream = io.StringIO()
-    ry.dump(data, stream)
-    raw = stream.getvalue()
+    raw = _dump_generated_yaml(data)
 
     raw = (
         _INIT_FILE_HEADER + "\n\n\n"
@@ -3460,6 +3503,7 @@ def main() -> int:
     sub.add_parser("switch", help="list all layouts and interactively select one to apply")
     sub.add_parser("auto", help="auto-apply the preferred layout; abort if ambiguous")
     sub.add_parser("reset", help="re-enable all disabled displays")
+    sub.add_parser("detect", help="detect displays and print a displays YAML block")
     sub.add_parser("init", help="detect connected displays and generate a new config.yml")
 
     args = parser.parse_args()
@@ -3492,6 +3536,8 @@ def main() -> int:
             return status_launch_agent()
         case "reset":
             return reset_main()
+        case "detect":
+            return detect_main()
         case "init":
             return init_main(_CONFIG_PATH)
 

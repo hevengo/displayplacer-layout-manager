@@ -39,7 +39,8 @@ The "match by manufacture week/year" approach (used in [FloWi's gist](https://gi
 
 ### 3. ioreg (IOKit Registry)
 
-The `AppleCLCD2` framebuffer entries under `dispext0`, `dispext1`, etc. each have a `DisplayAttributes` dict containing:
+The framebuffer entries under `dispext0`, `dispext1`, etc. each have a
+`DisplayAttributes` dict containing:
 
 - **`PortID`** — unique per framebuffer (e.g., `32`, `209768448`)
 - **`AlphanumericSerialNumber`** — the true unique hardware serial from the EDID extension block
@@ -49,6 +50,12 @@ The `AppleCLCD2` framebuffer entries under `dispext0`, `dispext1`, etc. each hav
 | `dispext0` | 32 | `ABCDEF012345` | VG28UQL1A |
 | `dispext1` | 209768448 | `9876543210123` | VG28UQL1A |
 | `dispext2` | 209772544 | *(none)* | ASUS PG32UQ |
+
+The original investigation observed these entries under `AppleCLCD2`. On newer
+macOS versions the same `DisplayAttributes` data may instead be exposed by
+`IOMobileFramebufferShim` or `IOMobileFramebuffer`, with `AppleCLCD2` returning
+no entries. The script now tries those modern framebuffer classes first and
+keeps `AppleCLCD2` as a legacy fallback.
 
 The Thunderbolt port metadata also contains EDID with these serials, along with `ParentPortNumber` (physical USB-C port) and `Tunneled` (whether routed through a Thunderbolt tunnel).
 
@@ -68,9 +75,9 @@ The Thunderbolt port metadata also contains EDID with these serials, along with 
 
 | Contextual ID | IODisplayLocation |
 |---------------|-------------------|
-| 4 | `IOService:/.../dispext2@AA000000/AppleCLCD2` |
-| 2 | `IOService:/.../dispext0@BB000000/AppleCLCD2` |
-| 5 | `IOService:/.../dispext1@CC000000/AppleCLCD2` |
+| 4 | `IOService:/.../dispext2@AA000000/...` |
+| 2 | `IOService:/.../dispext0@BB000000/...` |
+| 5 | `IOService:/.../dispext1@CC000000/...` |
 
 This closes the loop:
 
@@ -78,7 +85,7 @@ This closes the loop:
 CGDisplayID (contextual ID)
   → CoreDisplay_DisplayCreateInfoDictionary()
     → IODisplayLocation → dispext index
-      → ioreg AppleCLCD2 DisplayAttributes
+      → ioreg framebuffer DisplayAttributes
         → AlphanumericSerialNumber (unique hardware serial)
 ```
 
@@ -92,7 +99,9 @@ contextual_id=5  →  IODisplayLocation=.../dispext1  →  AlphaSerial="98765432
 This chain can be queried at runtime using:
 
 1. **ctypes** to call `CoreDisplay_DisplayCreateInfoDictionary(ctx_id)` — extract `IODisplayLocation`
-2. **ioreg** (`ioreg -r -c AppleCLCD2 -d 1 -a`) parsed as plist — extract `AlphanumericSerialNumber` per `IONameMatched` (dispext index)
+2. **ioreg** parsed as plist — query `IOMobileFramebufferShim`,
+   `IOMobileFramebuffer`, then `AppleCLCD2`, and extract
+   `AlphanumericSerialNumber` per `IONameMatched` (dispext index)
 
 No pyobjc dependency is required; `ctypes` + CoreFoundation helpers suffice.
 
@@ -113,4 +122,4 @@ Instead of offering two layout permutations and asking the user to pick, the scr
 
 - `CoreDisplay_DisplayCreateInfoDictionary` is a **private API** — it could break in a future macOS update, though it has been stable across macOS 12–15.
 - The `AlphanumericSerialNumber` is read from the EDID extension block. Monitors that don't populate this field would need a different distinguishing strategy (PortID, Tunneled status, etc.).
-- The ioreg query (`ioreg -r -c AppleCLCD2 -d 1 -a`) takes ~3-4 seconds due to IOKit enumeration overhead.
+- The ioreg query can take several seconds due to IOKit enumeration overhead.

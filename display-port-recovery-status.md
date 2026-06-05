@@ -35,6 +35,17 @@ USB / USB-C display-adapter candidates from the same snapshot:
 - `location=1146880 (0x118000)`:
   CalDigit Element Hub billboard/control device.
 
+Physical adapter note:
+
+- The USB-C to HDMI adapter in use is a Cable Matters branded adapter.
+- The adapter may still appear in IOKit under the internal bridge-chip vendor
+  rather than the retail brand.
+- Given the brand and symptom, the `Synaptics VMM7100` entry is the most likely
+  USB-C/HDMI bridge candidate to investigate first.
+- The two `Microsoft Surface USB-C to DisplayPort Adapter` entries may be other
+  USB-C display devices, stale naming from the bridge firmware, or unrelated
+  adapters. Confirm by dry-run/matching before resetting either one.
+
 The display came back online while only read-only or dry-run diagnostics were
 being run. No actual reset or display toggle was executed.
 
@@ -105,9 +116,13 @@ displayplacer "id:3 res:2560x1440 hz:60 color_depth:8 enabled:true scaling:on or
   signal.
 - Walking the display/USB registry or asking displayplacer/CoreGraphics for
   state may have coincided with, or indirectly nudged, re-enumeration.
-- The Microsoft Surface adapter entries and Synaptics VMM7100 entry are the most
-  interesting USB reset targets. The CalDigit hub entries should be treated as
-  lower-priority because resetting a hub is broader and riskier.
+- The Synaptics VMM7100 entry is now the most interesting USB reset target
+  because the physical adapter is a Cable Matters USB-C to HDMI adapter and the
+  VMM7100 looks like an adapter bridge-chip identity.
+- The Microsoft Surface adapter entries remain worth checking with dry-run, but
+  should not be assumed to be the Cable Matters adapter without confirmation.
+- The CalDigit hub entries should be treated as lower-priority because resetting
+  a hub is broader and riskier.
 
 ## Diagnostic Tool Added
 
@@ -124,6 +139,8 @@ Useful read-only commands:
 ```bash
 ./display-port-recovery-diagnostics.py snapshot
 ./display-port-recovery-diagnostics.py snapshot --json
+./display-port-recovery-diagnostics.py sls-detect
+./display-port-recovery-diagnostics.py iokit-probe
 ./display-port-recovery-diagnostics.py reapply-mode --id 3 --dry-run
 ./display-port-recovery-diagnostics.py usb-reset --location 17825792 --dry-run
 ```
@@ -132,11 +149,22 @@ Guarded experimental commands:
 
 ```bash
 ./display-port-recovery-diagnostics.py reapply-mode --id 3
+./display-port-recovery-diagnostics.py ddc-dpms-cycle --display 'ASUS PG32UQ' --yes
+./display-port-recovery-diagnostics.py sleep-displays --yes
 ./display-port-recovery-diagnostics.py displayplacer-toggle --id 3 --yes
 ./display-port-recovery-diagnostics.py cgs-toggle --id 3 --yes
 ./display-port-recovery-diagnostics.py mode-cycle --id 3 --temporary-res 1920x1080 --temporary-hz 60 --yes
+./display-port-recovery-diagnostics.py displaypolicyd-restart --yes
 ./display-port-recovery-diagnostics.py usb-reset --location 17825792 --yes
 ```
+
+The `sls-detect` command calls SkyLight's private `SLSDetectDisplays()` soft
+reprobe. This is believed to be the same low-level action behind macOS
+"Detect Displays" and is now the first software nudge to try.
+
+The `iokit-probe` command calls `IOServiceRequestProbe` against `AppleCLCD2`
+and `AppleDisplay` services. It is read-only from a layout perspective but asks
+the display services to reprobe.
 
 The USB reset command compiles a temporary C helper that can use legacy IOUSBLib
 to attempt `ResetDevice`, `USBDeviceReEnumerate`, or open/close on a USB device
@@ -161,26 +189,43 @@ mkdir -p captures
 5. Try the least invasive nudges first:
 
 ```bash
+./display-port-recovery-diagnostics.py sls-detect
 ./display-port-recovery-diagnostics.py reapply-mode --id 3
+```
+
+6. If macOS still reports the display but the monitor still says no signal, try
+   monitor-side and display-service nudges:
+
+```bash
+./display-port-recovery-diagnostics.py ddc-dpms-cycle --display 'ASUS PG32UQ' --yes
+./display-port-recovery-diagnostics.py sleep-displays --yes
+./display-port-recovery-diagnostics.py iokit-probe
 ./display-port-recovery-diagnostics.py mode-cycle --id 3 --temporary-res 1920x1080 --temporary-hz 60 --yes
 ```
 
-6. If still broken, identify the adapter candidate with dry-run first:
+7. If still broken, identify the adapter candidate with dry-run first:
 
 ```bash
+./display-port-recovery-diagnostics.py usb-reset --location 17825792 --dry-run
 ./display-port-recovery-diagnostics.py usb-reset --location 1245184 --dry-run
 ./display-port-recovery-diagnostics.py usb-reset --location 1310720 --dry-run
-./display-port-recovery-diagnostics.py usb-reset --location 17825792 --dry-run
 ```
 
-7. Only after confirming which `locationID` corresponds to the physical adapter,
+8. Only after confirming which `locationID` corresponds to the physical adapter,
    try the real reset:
 
 ```bash
 ./display-port-recovery-diagnostics.py usb-reset --location 17825792 --yes
 ```
 
-8. If software nudges fail, the remaining escalation is:
+9. If still broken, restart `displaypolicyd` before the heavier WindowServer
+   option:
+
+```bash
+./display-port-recovery-diagnostics.py displaypolicyd-restart --yes
+```
+
+10. If software nudges fail, the remaining escalation is:
 
 ```bash
 ./display-port-recovery-diagnostics.py windowserver-restart --yes
