@@ -350,10 +350,15 @@ tail -f /tmp/displayplacer-daemon.log
 
 ## Command reference
 
+When `config.yml` exists, the script validates it before running every command except
+`init`, `detect`, and `reset`. Config errors are printed immediately to stderr and
+also appended to `/tmp/displayplacer-daemon.log`.
+
 | Command | Description |
 |---|---|
 | *(no command)* | Show ASCII diagram of current display arrangement with detailed info |
 | `init` | Detect connected displays and generate a new `config.yml` |
+| `detect` | Print an init-style `displays:` YAML block without reading or writing `config.yml` |
 | `config` | Interactive display and layout configuration editor |
 | `auto` | Auto-apply the preferred layout for the current display set |
 | `switch` | List all layouts and interactively select one to apply |
@@ -367,6 +372,16 @@ tail -f /tmp/displayplacer-daemon.log
 | `status` | Show whether the LaunchAgent is installed and running |
 
 ## Troubleshooting
+
+### Config errors
+
+If `config.yml` exists but is invalid, most commands exit before taking action and
+print a concise `Config error: ...` message to stderr. The same message is appended
+to `/tmp/displayplacer-daemon.log` with a timestamp.
+
+The `init`, `detect`, and `reset` commands remain available even when the existing
+config is invalid, so you can inspect displays, regenerate config, or re-enable
+screens while recovering.
 
 ### displayplacer not found
 

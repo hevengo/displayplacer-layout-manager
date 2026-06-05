@@ -155,6 +155,7 @@ _PNP_BRANDS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _CONFIG_PATH = Path(__file__).resolve().parent / "config.yml"
+_CONFIG_PREFLIGHT_EXEMPT_COMMANDS = {"init", "detect", "reset"}
 
 
 class ConfigError(SystemExit):
@@ -162,6 +163,46 @@ class ConfigError(SystemExit):
 
     def __init__(self, msg: str) -> None:
         super().__init__(f"Config error: {msg}")
+
+
+def _format_config_exception(exc: BaseException) -> str:
+    """Return a concise config error message without traceback details."""
+    if isinstance(exc, ConfigError):
+        message = str(exc)
+    else:
+        detail = str(exc).strip() or exc.__class__.__name__
+        message = f"Config error: {detail}"
+    if not message.startswith("Config error:"):
+        message = f"Config error: {message}"
+    return message
+
+
+def _append_config_preflight_log(message: str) -> None:
+    """Append a config preflight error to the daemon log, best effort."""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_AGENT_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
+
+
+def _load_config_preflight(
+    path: Path,
+) -> tuple[dict[str, KnownScreen], dict[tuple[str, ...], list[Layout]], Options] | None:
+    """Validate config.yml for top-level commands, reporting failures immediately."""
+    try:
+        return load_config(path)
+    except ConfigError as exc:
+        message = _format_config_exception(exc)
+        print(message, file=sys.stderr)
+        _append_config_preflight_log(message)
+        return None
+    except Exception as exc:
+        message = _format_config_exception(exc)
+        print(message, file=sys.stderr)
+        _append_config_preflight_log(message)
+        return None
 
 
 def load_config(
@@ -3508,6 +3549,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    validated_config = None
+    if (
+        args.command not in _CONFIG_PREFLIGHT_EXEMPT_COMMANDS
+        and _CONFIG_PATH.exists()
+    ):
+        validated_config = _load_config_preflight(_CONFIG_PATH)
+        if validated_config is None:
+            return 1
+
     match args.command:
         case "install":
             return install_launch_agent()
@@ -3558,10 +3608,18 @@ def main() -> int:
         case "auto":
             return auto_main(_CONFIG_PATH)
         case "daemon":
-            known_screens, device_set_layouts, options = load_config(_CONFIG_PATH)
+            known_screens, device_set_layouts, options = (
+                validated_config
+                if validated_config is not None
+                else load_config(_CONFIG_PATH)
+            )
             return daemon_main(known_screens, device_set_layouts, options)
         case _:
-            known_screens, *_ = load_config(_CONFIG_PATH)
+            known_screens, *_ = (
+                validated_config
+                if validated_config is not None
+                else load_config(_CONFIG_PATH)
+            )
             return show_displays(known_screens)
 
 
