@@ -263,14 +263,64 @@ See `display-identification-facts.md` for the full technical investigation and c
 The script can run as a persistent daemon that automatically re-applies the display layout when:
 
 - The system **wakes from sleep** (layout at 5s, 10s, 15s after wake)
-- A display is **added or removed** — clamshell open/close, hot-plug (layout at 2s, 5s, 10s)
+- A display is **added or removed** — including hot-plug and undocking (layout at 2s, 5s, 10s)
 - On **startup** (covers the login case)
 
 ```bash
 ./display-layout-manager.py daemon
 ```
 
-Multiple events in quick succession are debounced — pending timers are cancelled and rescheduled. The daemon uses IOKit power notifications and CoreGraphics display reconfiguration callbacks via `ctypes` — no additional dependencies required.
+Multiple events in quick succession are debounced — an obsolete retry batch is
+cancelled and replaced, while every attempt in the current batch still runs. The
+daemon uses IOKit power and clamshell notifications plus CoreGraphics display
+reconfiguration callbacks via `ctypes` — no additional dependencies required.
+
+### Automatic display safety
+
+Display safety is enabled by default on MacBooks. It protects the external-only
+workflow where the built-in panel has been disabled and the external display is
+then disconnected.
+
+While the MacBook is in external-only mode, the daemon freezes the enabled
+physical external-monitor set as a safety baseline. A display removal/disable
+event or the 30-second watchdog starts recovery if any baseline monitor remains
+missing for two seconds. This deliberately enables the built-in panel even when
+another external monitor is still active or macOS keeps a disconnected
+framebuffer as a ghost display. An AC-to-battery transition is also treated as
+an undock signal while external-only mode is active.
+
+Automatic recovery enables only the built-in panel. It targets cached built-in
+display IDs as well as the current ID, so recovery still works when a closed lid
+causes macOS to omit the built-in display from its current display list. Recovery
+is retried after API, snapshot, verification, or display-operation-lock failures.
+The manual `reset` command and the menu's **Reset displays** action retain their
+broader behavior and re-enable every disabled physical display.
+
+A sleeping external display remains "online" and counts as present, so ordinary
+monitor sleep does not trigger recovery. Deliberate layout changes are exempt:
+displays that a layout intentionally disables do not count as losses, and a
+successful settled layout establishes its enabled external monitors as the new
+baseline. Under the maximum-safety policy, a later loss of even one member of
+that baseline enables the MacBook panel.
+
+If the lid is closed before undocking, display loss or AC-to-battery can trigger
+a bounded internal-panel recovery without relying on macOS's `causesSleep` bit.
+Pending recovery survives sleep; wake and lid-open handling refresh power and lid
+state and retry immediately. Code cannot run while the Mac is already asleep, so
+an undock that happens entirely during sleep is handled on wake/open.
+
+Configure the behavior under `options`:
+
+```yaml
+options:
+  enable-display-safety: true
+  display-watchdog-interval: 30
+```
+
+Set `enable-display-safety: false` to disable both event-driven recovery and the
+watchdog. Set `display-watchdog-interval: 0` to keep event-driven recovery but
+disable periodic checks. The feature automatically stays inactive on hardware
+without a MacBook clamshell.
 
 ### Menu bar integration
 

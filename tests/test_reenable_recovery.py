@@ -131,6 +131,17 @@ class DisabledDisplayRecoveryTests(unittest.TestCase):
             "Unable to find screen 3 - skipping changes for that screen",
         )
 
+    def test_displayplacer_fallback_timeout_is_reported(self):
+        with patch.object(
+            dlm.subprocess,
+            "run",
+            side_effect=dlm.subprocess.TimeoutExpired("displayplacer", 1),
+        ):
+            result = dlm._reenable_displays_displayplacer([3], timeout=1)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_stage, "enable_display_timeout:3")
+
     def test_cgs_success_but_inactive_display_tries_fallback_then_aborts(self):
         matched = self._matched_with_disabled_center()
         cgs_success = dlm.ReenableResult(

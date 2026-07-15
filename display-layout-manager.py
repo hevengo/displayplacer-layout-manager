@@ -21,8 +21,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -109,6 +112,164 @@ class ReenableResult:
 @dataclass
 class Options:
     enable_menu_bar: bool = False
+    enable_display_safety: bool = True
+    display_watchdog_interval: int = 30
+
+
+@dataclass(frozen=True)
+class ClamshellState:
+    """Current portable-lid state reported by IOPMrootDomain."""
+
+    available: bool
+    closed: bool = False
+    causes_sleep: bool = False
+
+
+class PowerSourceState(StrEnum):
+    """Power source currently supplying the Mac."""
+
+    UNKNOWN = "unknown"
+    AC = "ac"
+    BATTERY = "battery"
+    UPS = "ups"
+
+
+@dataclass(frozen=True, order=True)
+class PhysicalDisplayIdentity:
+    """Stable-enough physical identity; duplicates are tracked as a multiset."""
+
+    vendor: int
+    model: int
+    serial: int
+
+
+@dataclass(frozen=True)
+class DisplayOperationIntent:
+    """Displays a layout operation deliberately enables and disables."""
+
+    name: str
+    expected_enabled_ids: frozenset[int]
+    expected_disabled_ids: frozenset[int]
+
+
+@dataclass(frozen=True)
+class DisplaySafetyDisplay:
+    """Display metadata captured in one CoreGraphics snapshot."""
+
+    cg_id: int
+    serial: int
+    vendor: int
+    model: int
+    is_builtin: bool
+    is_active: bool
+    is_online: bool
+    is_asleep: bool
+    is_connected: bool
+
+    @property
+    def identity(self) -> PhysicalDisplayIdentity | None:
+        if self.vendor == 0 and self.serial == 0:
+            return None
+        return PhysicalDisplayIdentity(self.vendor, self.model, self.serial)
+
+    @property
+    def is_identified_physical(self) -> bool:
+        return self.is_builtin or self.identity is not None
+
+
+@dataclass(frozen=True)
+class DisplaySafetySnapshot:
+    """Consistent active/online/disabled state used by display safety."""
+
+    displays: tuple[DisplaySafetyDisplay, ...]
+
+    @property
+    def active_ids(self) -> frozenset[int]:
+        return frozenset(d.cg_id for d in self.displays if d.is_active)
+
+    @property
+    def online_ids(self) -> frozenset[int]:
+        return frozenset(d.cg_id for d in self.displays if d.is_online)
+
+    @property
+    def sleeping_ids(self) -> frozenset[int]:
+        return frozenset(d.cg_id for d in self.displays if d.is_asleep)
+
+    @property
+    def builtin_ids(self) -> frozenset[int]:
+        return frozenset(d.cg_id for d in self.displays if d.is_builtin)
+
+    @property
+    def disabled_ids(self) -> tuple[int, ...]:
+        return tuple(
+            d.cg_id for d in self.displays
+            if d.is_identified_physical and d.is_connected and not d.is_active
+        )
+
+    @property
+    def by_id(self) -> dict[int, DisplaySafetyDisplay]:
+        return {display.cg_id: display for display in self.displays}
+
+
+class _TimerBatch:
+    """A replaceable timer generation whose callbacks do not cancel siblings."""
+
+    def __init__(
+        self,
+        timer_factory: Callable[[float, Callable[[], None]], object] | None = None,
+    ) -> None:
+        self._timer_factory = timer_factory or threading.Timer
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._timers: set[object] = set()
+
+    def schedule(
+        self,
+        delays: tuple[float, ...],
+        callback: Callable[[], None],
+    ) -> None:
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            old_timers = list(self._timers)
+            self._timers.clear()
+            new_timers: list[object] = []
+
+            for delay in delays:
+                holder: dict[str, object] = {}
+
+                def run(holder=holder) -> None:
+                    timer = holder["timer"]
+                    with self._lock:
+                        self._timers.discard(timer)
+                        if generation != self._generation:
+                            return
+                    callback()
+
+                timer = self._timer_factory(delay, run)
+                holder["timer"] = timer
+                if hasattr(timer, "daemon"):
+                    timer.daemon = True
+                self._timers.add(timer)
+                new_timers.append(timer)
+
+        for timer in old_timers:
+            timer.cancel()
+        for timer in new_timers:
+            timer.start()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._generation += 1
+            timers = list(self._timers)
+            self._timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._timers)
 
 
 @dataclass
@@ -220,9 +381,32 @@ def load_config(
         raise ConfigError(f"{path} is not a valid YAML mapping")
 
     # --- options ---
-    raw_options = raw.get("options") or {}
+    raw_options = raw.get("options")
+    if raw_options is None:
+        raw_options = {}
+    if not isinstance(raw_options, dict):
+        raise ConfigError(f"'options' in {path} must be a mapping")
+
+    def boolean_option(name: str, default: bool) -> bool:
+        value = raw_options.get(name, default)
+        if not isinstance(value, bool):
+            raise ConfigError(f"option '{name}' must be true or false")
+        return value
+
+    watchdog_interval = raw_options.get("display-watchdog-interval", 30)
+    if (
+        not isinstance(watchdog_interval, int)
+        or isinstance(watchdog_interval, bool)
+        or watchdog_interval < 0
+    ):
+        raise ConfigError(
+            "option 'display-watchdog-interval' must be a non-negative integer"
+        )
+
     options = Options(
-        enable_menu_bar=bool(raw_options.get("enable-menu-bar", False)),
+        enable_menu_bar=boolean_option("enable-menu-bar", False),
+        enable_display_safety=boolean_option("enable-display-safety", True),
+        display_watchdog_interval=watchdog_interval,
     )
 
     # --- displays ---
@@ -770,105 +954,158 @@ def _get_disabled_displays(
     CGGetActiveDisplayList caches that accumulate in long-lived processes
     (e.g. the daemon).
     """
-    if fresh:
-        return _get_disabled_displays_subprocess()
+    snapshot = _query_display_safety_snapshot(fresh=fresh)
+    if snapshot is None:
+        return []
+    return [
+        (d.cg_id, d.serial, d.vendor, d.model, d.is_builtin)
+        for d in snapshot.displays
+        if d.is_identified_physical and d.is_connected and not d.is_active
+    ]
 
+
+def _coregraphics_id_set(cg, function_name: str) -> set[int] | None:
+    """Call a CoreGraphics display-list function and return its IDs."""
+    c_uint32 = ctypes.c_uint32
+    max_displays = 32
+    function = getattr(cg, function_name)
+    function.argtypes = [
+        c_uint32, ctypes.POINTER(c_uint32), ctypes.POINTER(c_uint32),
+    ]
+    function.restype = ctypes.c_int32
+    ids = (c_uint32 * max_displays)()
+    count = c_uint32(0)
+    if function(max_displays, ids, ctypes.byref(count)) != 0:
+        return None
+    return {int(ids[i]) for i in range(count.value)}
+
+
+def _query_display_safety_snapshot_in_process() -> DisplaySafetySnapshot | None:
+    """Capture active, online, sleeping, and disabled displays consistently."""
     try:
         cg_path = ctypes.util.find_library("CoreGraphics")
         if not cg_path:
-            return []
+            return None
         cg = ctypes.cdll.LoadLibrary(cg_path)
-    except OSError:
-        return []
+        connected = _coregraphics_id_set(cg, "CGSGetDisplayList")
+        active = _coregraphics_id_set(cg, "CGGetActiveDisplayList")
+        online = _coregraphics_id_set(cg, "CGGetOnlineDisplayList")
+        if connected is None or active is None or online is None:
+            return None
 
-    c_uint32 = ctypes.c_uint32
-    max_displays = 16
+        c_uint32 = ctypes.c_uint32
+        for name in (
+            "CGDisplaySerialNumber",
+            "CGDisplayVendorNumber",
+            "CGDisplayModelNumber",
+            "CGDisplayIsBuiltin",
+            "CGDisplayIsAsleep",
+        ):
+            function = getattr(cg, name)
+            function.argtypes = [c_uint32]
+            function.restype = c_uint32
 
-    cg.CGSGetDisplayList.argtypes = [
-        c_uint32, ctypes.POINTER(c_uint32), ctypes.POINTER(c_uint32),
-    ]
-    cg.CGSGetDisplayList.restype = ctypes.c_int32
-    cg.CGGetActiveDisplayList.argtypes = [
-        c_uint32, ctypes.POINTER(c_uint32), ctypes.POINTER(c_uint32),
-    ]
-    cg.CGGetActiveDisplayList.restype = ctypes.c_int32
-
-    all_ids = (c_uint32 * max_displays)()
-    all_cnt = c_uint32(0)
-    if cg.CGSGetDisplayList(max_displays, all_ids, ctypes.byref(all_cnt)) != 0:
-        return []
-
-    active_ids = (c_uint32 * max_displays)()
-    active_cnt = c_uint32(0)
-    if cg.CGGetActiveDisplayList(max_displays, active_ids, ctypes.byref(active_cnt)) != 0:
-        return []
-
-    active_set = {active_ids[i] for i in range(active_cnt.value)}
-
-    result: list[tuple[int, int, int, int, bool]] = []
-    for i in range(all_cnt.value):
-        d = all_ids[i]
-        if d in active_set:
-            continue
-        serial = cg.CGDisplaySerialNumber(d)
-        vendor = cg.CGDisplayVendorNumber(d)
-        model = cg.CGDisplayModelNumber(d)
-        builtin = bool(cg.CGDisplayIsBuiltin(d))
-        if vendor == 0 and serial == 0:
-            continue
-        result.append((int(d), int(serial), int(vendor), int(model), builtin))
-    return result
+        displays: list[DisplaySafetyDisplay] = []
+        for display_id in sorted(connected | active | online):
+            serial = int(cg.CGDisplaySerialNumber(display_id))
+            vendor = int(cg.CGDisplayVendorNumber(display_id))
+            displays.append(DisplaySafetyDisplay(
+                cg_id=display_id,
+                serial=serial,
+                vendor=vendor,
+                model=int(cg.CGDisplayModelNumber(display_id)),
+                is_builtin=bool(cg.CGDisplayIsBuiltin(display_id)),
+                is_active=display_id in active,
+                is_online=display_id in online,
+                is_asleep=bool(cg.CGDisplayIsAsleep(display_id)),
+                is_connected=display_id in connected,
+            ))
+        return DisplaySafetySnapshot(tuple(displays))
+    except (AttributeError, OSError):
+        return None
 
 
-def _get_disabled_displays_subprocess() -> list[tuple[int, int, int, int, bool]]:
-    """Run disabled-display discovery in a fresh subprocess.
-
-    The daemon process may have stale CGGetActiveDisplayList caches after
-    programmatic display configuration changes.  A fresh process sees the
-    actual current state.
-    """
+def _query_display_safety_snapshot_subprocess(
+    timeout: float = 10.0,
+) -> DisplaySafetySnapshot | None:
+    """Capture display state in a fresh process to avoid WindowServer caches."""
     import json as _json
 
     script = (
         "import ctypes,ctypes.util,json,sys\n"
         "p=ctypes.util.find_library('CoreGraphics')\n"
-        "if not p:print('[]');sys.exit()\n"
-        "cg=ctypes.cdll.LoadLibrary(p);U=ctypes.c_uint32\n"
-        "cg.CGSGetDisplayList.argtypes="
-        "[U,ctypes.POINTER(U),ctypes.POINTER(U)]\n"
-        "cg.CGSGetDisplayList.restype=ctypes.c_int32\n"
-        "cg.CGGetActiveDisplayList.argtypes="
-        "[U,ctypes.POINTER(U),ctypes.POINTER(U)]\n"
-        "cg.CGGetActiveDisplayList.restype=ctypes.c_int32\n"
-        "a=(U*16)();ac=U(0)\n"
-        "if cg.CGSGetDisplayList(16,a,ctypes.byref(ac))!=0:"
-        "print('[]');sys.exit()\n"
-        "b=(U*16)();bc=U(0)\n"
-        "if cg.CGGetActiveDisplayList(16,b,ctypes.byref(bc))!=0:"
-        "print('[]');sys.exit()\n"
-        "act={b[i] for i in range(bc.value)};r=[]\n"
-        "for i in range(ac.value):\n"
-        " d=a[i]\n"
-        " if d in act:continue\n"
-        " s=cg.CGDisplaySerialNumber(d);v=cg.CGDisplayVendorNumber(d)\n"
-        " m=cg.CGDisplayModelNumber(d);bi=bool(cg.CGDisplayIsBuiltin(d))\n"
-        " if v==0 and s==0:continue\n"
-        " r.append([int(d),int(s),int(v),int(m),bi])\n"
-        "print(json.dumps(r))\n"
+        "if not p:sys.exit(2)\n"
+        "cg=ctypes.cdll.LoadLibrary(p);U=ctypes.c_uint32;N=32\n"
+        "def ids(name):\n"
+        " f=getattr(cg,name);f.argtypes=[U,ctypes.POINTER(U),ctypes.POINTER(U)]\n"
+        " f.restype=ctypes.c_int32;a=(U*N)();n=U(0)\n"
+        " if f(N,a,ctypes.byref(n))!=0:raise RuntimeError(name)\n"
+        " return {int(a[i]) for i in range(n.value)}\n"
+        "connected=ids('CGSGetDisplayList')\n"
+        "active=ids('CGGetActiveDisplayList')\n"
+        "online=ids('CGGetOnlineDisplayList')\n"
+        "for name in ('CGDisplaySerialNumber','CGDisplayVendorNumber',"
+        "'CGDisplayModelNumber','CGDisplayIsBuiltin','CGDisplayIsAsleep'):\n"
+        " f=getattr(cg,name);f.argtypes=[U];f.restype=U\n"
+        "rows=[]\n"
+        "for d in sorted(connected|active|online):\n"
+        " s=int(cg.CGDisplaySerialNumber(d));v=int(cg.CGDisplayVendorNumber(d))\n"
+        " rows.append([d,s,v,int(cg.CGDisplayModelNumber(d)),"
+        "bool(cg.CGDisplayIsBuiltin(d)),d in active,d in online,"
+        "bool(cg.CGDisplayIsAsleep(d)),d in connected])\n"
+        "print(json.dumps(rows))\n"
     )
     try:
         result = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
         if result.returncode != 0:
-            return []
-        return [
-            (d, s, v, m, b)
-            for d, s, v, m, b in _json.loads(result.stdout)
-        ]
-    except Exception:
+            return None
+        rows = _json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return None
+        return DisplaySafetySnapshot(tuple(
+            DisplaySafetyDisplay(
+                cg_id=int(row[0]),
+                serial=int(row[1]),
+                vendor=int(row[2]),
+                model=int(row[3]),
+                is_builtin=bool(row[4]),
+                is_active=bool(row[5]),
+                is_online=bool(row[6]),
+                is_asleep=bool(row[7]),
+                is_connected=bool(row[8]),
+            )
+            for row in rows
+        ))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+        return None
+
+
+def _query_display_safety_snapshot(
+    fresh: bool = False,
+    timeout: float = 10.0,
+) -> DisplaySafetySnapshot | None:
+    """Return a display safety snapshot, or None when querying failed."""
+    if fresh:
+        return _query_display_safety_snapshot_subprocess(timeout=timeout)
+    return _query_display_safety_snapshot_in_process()
+
+
+def _get_disabled_displays_subprocess() -> list[tuple[int, int, int, int, bool]]:
+    """Compatibility wrapper for fresh disabled-display discovery."""
+    snapshot = _query_display_safety_snapshot_subprocess()
+    if snapshot is None:
         return []
+    return [
+        (d.cg_id, d.serial, d.vendor, d.model, d.is_builtin)
+        for d in snapshot.displays
+        if d.is_identified_physical and d.is_connected and not d.is_active
+    ]
 
 
 def _disabled_display_objects(fresh: bool = False) -> list[Display]:
@@ -983,7 +1220,10 @@ def _reenable_displays_cgs(display_ids: list[int]) -> ReenableResult:
     )
 
 
-def _reenable_displays_displayplacer(display_ids: list[int]) -> ReenableResult:
+def _reenable_displays_displayplacer(
+    display_ids: list[int],
+    timeout: float = 10.0,
+) -> ReenableResult:
     """Best-effort fallback using displayplacer enabled:true per display."""
     if not display_ids:
         return ReenableResult(True, "none", [], message="no displays to enable")
@@ -993,12 +1233,19 @@ def _reenable_displays_displayplacer(display_ids: list[int]) -> ReenableResult:
             result = subprocess.run(
                 ["displayplacer", f"id:{did} enabled:true"],
                 capture_output=True, text=True, check=False,
+                timeout=timeout,
             )
         except FileNotFoundError:
             return ReenableResult(
                 False, "displayplacer", list(display_ids),
                 failed_stage="displayplacer_missing",
                 message="displayplacer not found",
+            )
+        except subprocess.TimeoutExpired:
+            return ReenableResult(
+                False, "displayplacer", list(display_ids),
+                failed_stage=f"enable_display_timeout:{did}",
+                message=f"displayplacer timed out after {timeout:g}s",
             )
         if result.returncode != 0:
             detail = _compact_process_output(result.stderr or result.stdout)
@@ -1015,14 +1262,22 @@ def _reenable_displays_displayplacer(display_ids: list[int]) -> ReenableResult:
     )
 
 
-def _reenable_displays(display_ids: list[int]) -> ReenableResult:
+def _reenable_displays(
+    display_ids: list[int],
+    fallback_timeout: float | None = None,
+) -> ReenableResult:
     """Re-enable displays, falling back to displayplacer if CGS fails."""
     cgs_result = _reenable_displays_cgs(display_ids)
     if cgs_result.success:
         return cgs_result
 
     _log(f"CGS re-enable failed: {_format_reenable_result(cgs_result)}")
-    displayplacer_result = _reenable_displays_displayplacer(display_ids)
+    if fallback_timeout is None:
+        displayplacer_result = _reenable_displays_displayplacer(display_ids)
+    else:
+        displayplacer_result = _reenable_displays_displayplacer(
+            display_ids, timeout=fallback_timeout,
+        )
     if displayplacer_result.success:
         _log(
             "displayplacer fallback succeeded: "
@@ -2041,9 +2296,37 @@ def show_displays(
 # ---------------------------------------------------------------------------
 
 
+def _layout_operation_intent(
+    layout: Layout,
+    matched: list[MatchedDisplay],
+) -> DisplayOperationIntent:
+    """Translate a layout's deliberate enable/disable choices to CG IDs."""
+    by_key = {match.key: match for match in matched}
+
+    def ids_for(keys: set[str]) -> frozenset[int]:
+        result: set[int] = set()
+        for key in keys:
+            match = by_key.get(key)
+            if match and match.display.contextual_id.isdigit():
+                result.add(int(match.display.contextual_id))
+        return frozenset(result)
+
+    enabled_keys = set(layout.enabled or layout.positions)
+    return DisplayOperationIntent(
+        name=layout.name,
+        expected_enabled_ids=ids_for(enabled_keys),
+        expected_disabled_ids=ids_for(set(layout.disabled)),
+    )
+
+
 def apply_current_layout(
     known_screens: dict[str, KnownScreen],
     device_set_layouts: dict[tuple[str, ...], list[Layout]],
+    *,
+    begin_operation: Callable[[DisplayOperationIntent], None] | None = None,
+    finish_operation: (
+        Callable[[DisplayOperationIntent, int], None] | None
+    ) = None,
 ) -> tuple[int, str | None]:
     """Detect displays, match, and apply the single unambiguous layout.
 
@@ -2096,12 +2379,1157 @@ def apply_current_layout(
         matched, _ = match_displays(all_displays, known_screens, hw_map)
 
     _log(f"Applying: {', '.join(labels)} -> {layout.name}")
-    rc = _apply_layout(layout, matched, known_screens, allow_disable=False)
+    intent = _layout_operation_intent(layout, matched)
+    if begin_operation is not None:
+        begin_operation(intent)
+    rc = 1
+    try:
+        rc = _apply_layout(layout, matched, known_screens, allow_disable=False)
+    finally:
+        if finish_operation is not None:
+            finish_operation(intent, rc)
     if rc == 0:
         _log("Layout applied")
         return 0, layout.name
     _log(f"Layout application failed with code {rc}")
     return rc, None
+
+
+# ---------------------------------------------------------------------------
+# Display safety (event-driven recovery + watchdog)
+# ---------------------------------------------------------------------------
+
+_CLAMSHELL_STATE_BIT = 1 << 0
+_CLAMSHELL_SLEEP_BIT = 1 << 1
+_IOPM_MESSAGE_CLAMSHELL_STATE_CHANGE = 0xE0034100
+_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG = 1 << 0
+_CG_DISPLAY_ADD_FLAG = 1 << 4
+_CG_DISPLAY_REMOVE_FLAG = 1 << 5
+_CG_DISPLAY_DISABLED_FLAG = 1 << 9
+
+
+def _decode_clamshell_message(argument: int) -> ClamshellState:
+    """Decode kIOPMMessageClamshellStateChange's two-bit argument."""
+    return ClamshellState(
+        available=True,
+        closed=bool(argument & _CLAMSHELL_STATE_BIT),
+        causes_sleep=bool(argument & _CLAMSHELL_SLEEP_BIT),
+    )
+
+
+def _read_io_registry_boolean(iokit, cf, service: int, key: bytes) -> bool | None:
+    """Read a CFBoolean property from an IOKit registry service."""
+    c_void_p = ctypes.c_void_p
+    c_uint32 = ctypes.c_uint32
+    cf.CFStringCreateWithCString.argtypes = [c_void_p, ctypes.c_char_p, c_uint32]
+    cf.CFStringCreateWithCString.restype = c_void_p
+    cf.CFGetTypeID.argtypes = [c_void_p]
+    cf.CFGetTypeID.restype = ctypes.c_ulong
+    cf.CFBooleanGetTypeID.argtypes = []
+    cf.CFBooleanGetTypeID.restype = ctypes.c_ulong
+    cf.CFBooleanGetValue.argtypes = [c_void_p]
+    cf.CFBooleanGetValue.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [c_void_p]
+    cf.CFRelease.restype = None
+    iokit.IORegistryEntryCreateCFProperty.argtypes = [
+        c_uint32, c_void_p, c_void_p, c_uint32,
+    ]
+    iokit.IORegistryEntryCreateCFProperty.restype = c_void_p
+
+    key_ref = cf.CFStringCreateWithCString(None, key, 0x08000100)
+    if not key_ref:
+        return None
+    try:
+        value_ref = iokit.IORegistryEntryCreateCFProperty(
+            service, key_ref, None, 0,
+        )
+        if not value_ref:
+            return None
+        try:
+            if cf.CFGetTypeID(value_ref) != cf.CFBooleanGetTypeID():
+                return None
+            return bool(cf.CFBooleanGetValue(value_ref))
+        finally:
+            cf.CFRelease(value_ref)
+    finally:
+        cf.CFRelease(key_ref)
+
+
+def _read_clamshell_state(iokit, cf, root_service: int) -> ClamshellState:
+    """Read the initial portable-lid state from IOPMrootDomain."""
+    if not root_service:
+        return ClamshellState(False)
+    closed = _read_io_registry_boolean(
+        iokit, cf, root_service, b"AppleClamshellState",
+    )
+    if closed is None:
+        return ClamshellState(False)
+    causes_sleep = _read_io_registry_boolean(
+        iokit, cf, root_service, b"AppleClamshellCausesSleep",
+    )
+    return ClamshellState(
+        available=True,
+        closed=closed,
+        causes_sleep=bool(causes_sleep),
+    )
+
+
+def _power_source_state_from_text(value: str) -> PowerSourceState:
+    return {
+        "AC Power": PowerSourceState.AC,
+        "Battery Power": PowerSourceState.BATTERY,
+        "UPS Power": PowerSourceState.UPS,
+    }.get(value, PowerSourceState.UNKNOWN)
+
+
+def _cf_string_to_text(cf, value_ref: int) -> str | None:
+    if not value_ref:
+        return None
+    c_void_p = ctypes.c_void_p
+    encoding = 0x08000100  # kCFStringEncodingUTF8
+    cf.CFStringGetCString.argtypes = [
+        c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    buffer = ctypes.create_string_buffer(128)
+    if not cf.CFStringGetCString(value_ref, buffer, len(buffer), encoding):
+        return None
+    return buffer.value.decode("utf-8")
+
+
+def _read_power_source_state(iokit, cf) -> PowerSourceState:
+    """Return the current power provider using IOPowerSources."""
+    c_void_p = ctypes.c_void_p
+    try:
+        iokit.IOPSCopyPowerSourcesInfo.argtypes = []
+        iokit.IOPSCopyPowerSourcesInfo.restype = c_void_p
+        iokit.IOPSGetProvidingPowerSourceType.argtypes = [c_void_p]
+        iokit.IOPSGetProvidingPowerSourceType.restype = c_void_p
+        cf.CFRelease.argtypes = [c_void_p]
+        cf.CFRelease.restype = None
+        info_ref = iokit.IOPSCopyPowerSourcesInfo()
+        if not info_ref:
+            return PowerSourceState.UNKNOWN
+        try:
+            value_ref = iokit.IOPSGetProvidingPowerSourceType(info_ref)
+            text = _cf_string_to_text(cf, value_ref)
+            return _power_source_state_from_text(text or "")
+        finally:
+            cf.CFRelease(info_ref)
+    except (
+        AttributeError,
+        OSError,
+        TypeError,
+        ValueError,
+        ctypes.ArgumentError,
+        UnicodeError,
+    ):
+        return PowerSourceState.UNKNOWN
+
+
+def _handle_system_will_sleep(
+    prepare: Callable[[], None],
+    acknowledge: Callable[[], None],
+    logger: Callable[[str], None] | None = None,
+) -> None:
+    """Run bounded pre-sleep work and always acknowledge the power event."""
+    log = logger or _log
+    try:
+        prepare()
+    except Exception as exc:
+        log(f"Display safety [system-will-sleep]: error: {exc}")
+    finally:
+        acknowledge()
+
+
+class DisplaySafetyController:
+    """Recover the built-in panel after a dock topology is lost."""
+
+    _NORMAL_RECOVERY_DELAYS = (2.0, 3.0, 5.0)
+    _IMMEDIATE_RECOVERY_DELAYS = (0.0, 1.0, 3.0)
+    _URGENT_RECOVERY_DELAYS = (0.0, 0.25)
+    _URGENT_LOCK_TIMEOUT = 0.25
+    _URGENT_SNAPSHOT_TIMEOUT = 1.0
+    _LAYOUT_SETTLE_DELAY = 2.0
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        watchdog_interval: int,
+        clamshell: ClamshellState,
+        operation_lock,
+        power_source: PowerSourceState = PowerSourceState.UNKNOWN,
+        snapshot_query: Callable[..., DisplaySafetySnapshot | None] | None = None,
+        reenable: Callable[[list[int]], ReenableResult] | None = None,
+        reenable_fallback: Callable[[list[int]], ReenableResult] | None = None,
+        schedule_layout: Callable[[str], None] | None = None,
+        logger: Callable[[str], None] | None = None,
+        timer_factory: Callable[[float, Callable[[], None]], object] | None = None,
+    ) -> None:
+        self._enabled = enabled
+        self._watchdog_interval = watchdog_interval
+        self._clamshell = clamshell
+        self._power_source = power_source
+        self._operation_lock = operation_lock
+        self._snapshot_query = snapshot_query or _query_display_safety_snapshot
+        self._reenable = reenable
+        self._reenable_fallback = reenable_fallback
+        self._schedule_layout = schedule_layout or (lambda _reason: None)
+        self._log = logger or _log
+        self._check_timers = _TimerBatch(timer_factory)
+        self._recovery_timers = _TimerBatch(timer_factory)
+        self._layout_settle_timers = _TimerBatch(timer_factory)
+        self._state_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._awake = True
+        self._known_builtin_ids: set[int] = set()
+        self._known_builtin_identities: set[PhysicalDisplayIdentity] = set()
+        self._last_snapshot_by_id: dict[int, DisplaySafetyDisplay] = {}
+        self._external_baseline: Counter[PhysicalDisplayIdentity] = Counter()
+        self._baseline_ids: dict[int, PhysicalDisplayIdentity] = {}
+        self._pending_display_loss = False
+        self._pending_power_loss = False
+        self._pending_zero_active = False
+        self._pending_trigger = ""
+        self._layout_intent: DisplayOperationIntent | None = None
+        self._layout_unexpected_loss = False
+        self._layout_expected_enabled_external: Counter[
+            PhysicalDisplayIdentity
+        ] = Counter()
+        self._layout_expected_disabled_external: Counter[
+            PhysicalDisplayIdentity
+        ] = Counter()
+
+    @property
+    def active(self) -> bool:
+        with self._state_lock:
+            return self._enabled and self._clamshell.available
+
+    @property
+    def pending_undock(self) -> bool:
+        with self._state_lock:
+            return self._pending_locked()
+
+    @property
+    def external_baseline(self) -> Counter[PhysicalDisplayIdentity]:
+        with self._state_lock:
+            return self._external_baseline.copy()
+
+    def _pending_locked(self) -> bool:
+        return (
+            self._pending_display_loss
+            or self._pending_power_loss
+            or self._pending_zero_active
+        )
+
+    def _pending_kinds_locked(self) -> str:
+        kinds: list[str] = []
+        if self._pending_display_loss:
+            kinds.append("display-loss")
+        if self._pending_power_loss:
+            kinds.append("ac-to-battery")
+        if self._pending_zero_active:
+            kinds.append("zero-active")
+        return ",".join(kinds) or "none"
+
+    def _arm_pending_locked(self, kind: str, trigger: str) -> None:
+        before = self._pending_locked()
+        if kind == "display-loss":
+            self._pending_display_loss = True
+        elif kind == "power-loss":
+            self._pending_power_loss = True
+        elif kind == "zero-active":
+            self._pending_zero_active = True
+        self._pending_trigger = trigger
+        if not before:
+            self._log(
+                f"Display safety [{trigger}]: recovery armed ({kind})"
+            )
+
+    def _clear_pending_locked(self, reason: str) -> None:
+        if self._pending_locked():
+            self._log(
+                "Display safety: recovery cleared "
+                f"({reason}; was {self._pending_kinds_locked()})"
+            )
+        self._pending_display_loss = False
+        self._pending_power_loss = False
+        self._pending_zero_active = False
+        self._pending_trigger = ""
+
+    def start(self) -> None:
+        """Start startup observation and the periodic watchdog."""
+        if not self._enabled:
+            self._log("Display safety disabled by configuration")
+            return
+        if not self._clamshell.available:
+            self._log("Display safety inactive: no MacBook clamshell detected")
+            return
+
+        state = self._clamshell
+        self._log(
+            "Display safety active: "
+            f"lid={'closed' if state.closed else 'open'}, "
+            f"causes_sleep={state.causes_sleep}, "
+            f"power={self._power_source.value}, "
+            f"watchdog={self._watchdog_interval}s"
+        )
+        self.request_check("startup")
+
+        if self._watchdog_interval > 0:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                name="display-safety-watchdog",
+                daemon=True,
+            )
+            self._watchdog_thread.start()
+
+    def stop(self) -> None:
+        """Stop the watchdog and cancel pending safety work."""
+        self._stop_event.set()
+        self._check_timers.cancel()
+        self._recovery_timers.cancel()
+        self._layout_settle_timers.cancel()
+        thread = self._watchdog_thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._watchdog_thread = None
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop_event.wait(self._watchdog_interval):
+            with self._state_lock:
+                eligible = (
+                    self._enabled
+                    and self._clamshell.available
+                    and self._awake
+                    and not self._clamshell.closed
+                )
+            if eligible:
+                self.request_check("watchdog")
+
+    def _query(
+        self,
+        trigger: str,
+        timeout: float = 10.0,
+    ) -> DisplaySafetySnapshot | None:
+        try:
+            snapshot = self._snapshot_query(fresh=True, timeout=timeout)
+        except Exception as exc:
+            self._log(f"Display safety [{trigger}]: snapshot error: {exc}")
+            return None
+        if snapshot is None:
+            self._log(f"Display safety [{trigger}]: snapshot query failed")
+        return snapshot
+
+    def _is_builtin_locked(self, display: DisplaySafetyDisplay) -> bool:
+        if display.is_builtin:
+            return True
+        identity = display.identity
+        if identity is not None and identity in self._known_builtin_identities:
+            return True
+        if display.cg_id not in self._known_builtin_ids:
+            return False
+        # Trust a cached contextual ID when the row is temporarily anonymous.
+        # If we have a known built-in identity and the ID now carries different
+        # metadata, macOS has reused that contextual ID for another display.
+        return identity is None or not self._known_builtin_identities
+
+    def _internal_active_locked(self, snapshot: DisplaySafetySnapshot) -> bool:
+        return any(
+            display.is_active and self._is_builtin_locked(display)
+            for display in snapshot.displays
+        )
+
+    def _physical_active_ids_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+    ) -> set[int]:
+        return {
+            display.cg_id
+            for display in snapshot.displays
+            if display.is_active
+            and (
+                display.is_identified_physical
+                or self._is_builtin_locked(display)
+            )
+        }
+
+    def _physical_online_ids_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+    ) -> set[int]:
+        return {
+            display.cg_id
+            for display in snapshot.displays
+            if display.is_online
+            and (
+                display.is_identified_physical
+                or self._is_builtin_locked(display)
+            )
+        }
+
+    def _intent_disables_internal_locked(self) -> bool:
+        intent = self._layout_intent
+        return bool(
+            intent
+            and intent.expected_disabled_ids & self._known_builtin_ids
+        )
+
+    def _external_online_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+    ) -> tuple[Counter[PhysicalDisplayIdentity], dict[int, PhysicalDisplayIdentity]]:
+        identities: Counter[PhysicalDisplayIdentity] = Counter()
+        ids: dict[int, PhysicalDisplayIdentity] = {}
+        for display in snapshot.displays:
+            identity = display.identity
+            if (
+                not display.is_online
+                or identity is None
+                or self._is_builtin_locked(display)
+            ):
+                continue
+            identities[identity] += 1
+            ids[display.cg_id] = identity
+        return identities, ids
+
+    def _external_active_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+    ) -> tuple[Counter[PhysicalDisplayIdentity], dict[int, PhysicalDisplayIdentity]]:
+        identities: Counter[PhysicalDisplayIdentity] = Counter()
+        ids: dict[int, PhysicalDisplayIdentity] = {}
+        for display in snapshot.displays:
+            identity = display.identity
+            if (
+                not display.is_active
+                or identity is None
+                or self._is_builtin_locked(display)
+            ):
+                continue
+            identities[identity] += 1
+            ids[display.cg_id] = identity
+        return identities, ids
+
+    @staticmethod
+    def _format_identities(
+        identities: Counter[PhysicalDisplayIdentity],
+    ) -> str:
+        if not identities:
+            return "none"
+        parts = []
+        for identity, count in sorted(identities.items()):
+            value = (
+                f"{identity.vendor:04x}:{identity.model:04x}:"
+                f"{identity.serial}"
+            )
+            parts.append(f"{value}x{count}" if count > 1 else value)
+        return ",".join(parts)
+
+    def _adopt_baseline_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+        trigger: str,
+        requested: Counter[PhysicalDisplayIdentity] | None = None,
+        preferred_ids: frozenset[int] = frozenset(),
+    ) -> bool:
+        external_online, online_ids = self._external_online_locked(snapshot)
+        if requested is None:
+            baseline, baseline_candidates = self._external_active_locked(
+                snapshot,
+            )
+        else:
+            baseline = requested.copy()
+            baseline_candidates = online_ids
+        if not baseline or baseline - external_online:
+            return False
+        baseline_ids = self._select_baseline_ids(
+            baseline_candidates, baseline, preferred_ids,
+        )
+        self._external_baseline = baseline
+        self._baseline_ids = baseline_ids
+        self._log(
+            f"Display safety [{trigger}]: external-only baseline="
+            f"{self._format_identities(baseline)} "
+            f"ids={sorted(baseline_ids)}"
+        )
+        return True
+
+    @staticmethod
+    def _select_baseline_ids(
+        available: dict[int, PhysicalDisplayIdentity],
+        baseline: Counter[PhysicalDisplayIdentity],
+        preferred_ids: set[int] | frozenset[int],
+    ) -> dict[int, PhysicalDisplayIdentity]:
+        remaining = baseline.copy()
+        baseline_ids: dict[int, PhysicalDisplayIdentity] = {}
+        ordered_ids = sorted(
+            available,
+            key=lambda display_id: (
+                display_id not in preferred_ids,
+                display_id,
+            ),
+        )
+        for display_id in ordered_ids:
+            identity = available[display_id]
+            if remaining[identity] > 0:
+                baseline_ids[display_id] = identity
+                remaining[identity] -= 1
+        return baseline_ids
+
+    def _observe_snapshot_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+        trigger: str,
+        *,
+        allow_adopt: bool,
+    ) -> None:
+        self._last_snapshot_by_id = snapshot.by_id
+        if not self._clamshell.closed:
+            for display in snapshot.displays:
+                if display.is_builtin:
+                    self._known_builtin_ids.add(display.cg_id)
+                    if display.identity is not None:
+                        self._known_builtin_identities.add(display.identity)
+
+        external, external_ids = self._external_online_locked(snapshot)
+        if self._external_baseline:
+            self._baseline_ids = self._select_baseline_ids(
+                external_ids,
+                self._external_baseline,
+                set(self._baseline_ids),
+            )
+
+        if (
+            self._internal_active_locked(snapshot)
+            and not self._intent_disables_internal_locked()
+        ):
+            self._external_baseline.clear()
+            self._baseline_ids.clear()
+            self._clear_pending_locked("internal display active")
+            return
+
+        if (
+            allow_adopt
+            and not self._clamshell.closed
+            and not self._external_baseline
+            and not self._pending_locked()
+            and self._layout_intent is None
+            and external
+        ):
+            self._adopt_baseline_locked(snapshot, trigger)
+
+    def _snapshot_summary_locked(self, snapshot: DisplaySafetySnapshot) -> str:
+        external, _ids = self._external_online_locked(snapshot)
+        missing = self._external_baseline - external
+        return (
+            f"lid={'closed' if self._clamshell.closed else 'open'}, "
+            f"power={self._power_source.value}, "
+            f"active={len(self._physical_active_ids_locked(snapshot))}, "
+            f"online={len(self._physical_online_ids_locked(snapshot))}, "
+            f"disabled={len(snapshot.disabled_ids)}, "
+            f"baseline={self._format_identities(self._external_baseline)}, "
+            f"missing={self._format_identities(missing)}, "
+            f"pending={self._pending_kinds_locked()}"
+        )
+
+    def _evaluate_snapshot(
+        self,
+        snapshot: DisplaySafetySnapshot,
+        trigger: str,
+        *,
+        schedule: bool,
+    ) -> None:
+        should_schedule = False
+        urgent = False
+        with self._state_lock:
+            self._observe_snapshot_locked(
+                snapshot, trigger, allow_adopt=True,
+            )
+            if self._internal_active_locked(snapshot):
+                self._log(
+                    f"Display safety [{trigger}]: internal active; "
+                    f"{self._snapshot_summary_locked(snapshot)}"
+                )
+                return
+
+            external, _ids = self._external_online_locked(snapshot)
+            if self._external_baseline:
+                missing = self._external_baseline - external
+                if missing:
+                    self._arm_pending_locked("display-loss", trigger)
+                elif self._pending_display_loss:
+                    self._pending_display_loss = False
+                    self._log(
+                        f"Display safety [{trigger}]: transient display loss cleared"
+                    )
+            else:
+                external_online = bool(external)
+                if (
+                    not self._physical_active_ids_locked(snapshot)
+                    and not external_online
+                ):
+                    if self._internal_target_ids_locked(snapshot):
+                        self._arm_pending_locked("zero-active", trigger)
+                elif self._pending_zero_active:
+                    self._pending_zero_active = False
+
+            pending = self._pending_locked()
+            should_schedule = schedule and pending and self._awake
+            urgent = should_schedule and self._clamshell.closed
+            self._log(
+                f"Display safety [{trigger}]: "
+                f"{'recovery pending' if pending else 'no recovery'}; "
+                f"{self._snapshot_summary_locked(snapshot)}"
+            )
+
+        if should_schedule:
+            self._schedule_recovery(
+                trigger,
+                immediate=False,
+                urgent=urgent,
+            )
+
+    def request_check(self, trigger: str) -> None:
+        """Enqueue a fresh safety observation outside a native callback."""
+        if not self.active or self._stop_event.is_set():
+            return
+        self._check_timers.schedule(
+            (0.0,), lambda: self._run_check(trigger),
+        )
+
+    def _run_check(self, trigger: str) -> None:
+        if self._stop_event.is_set():
+            return
+        snapshot = self._query(trigger)
+        if snapshot is None:
+            return
+        self._evaluate_snapshot(snapshot, trigger, schedule=True)
+
+    def _schedule_recovery(
+        self,
+        trigger: str,
+        *,
+        immediate: bool,
+        urgent: bool = False,
+    ) -> None:
+        if self._stop_event.is_set():
+            return
+        if urgent:
+            delays = self._URGENT_RECOVERY_DELAYS
+        elif immediate:
+            delays = self._IMMEDIATE_RECOVERY_DELAYS
+        else:
+            delays = self._NORMAL_RECOVERY_DELAYS
+        self._log(
+            f"Display safety [{trigger}]: recovery attempts at "
+            f"{'/'.join(f'{delay:g}' for delay in delays)}s"
+        )
+        self._recovery_timers.schedule(
+            delays,
+            lambda: self._attempt_internal_recovery(
+                trigger, allow_closed=urgent, urgent=urgent,
+            ),
+        )
+
+    def _internal_target_ids_locked(
+        self,
+        snapshot: DisplaySafetySnapshot,
+    ) -> list[int]:
+        by_id = snapshot.by_id
+        targets = {
+            display_id
+            for display_id in self._known_builtin_ids
+            if (
+                display_id not in by_id
+                or self._is_builtin_locked(by_id[display_id])
+            )
+        }
+        targets.update(snapshot.builtin_ids)
+        return sorted(targets - snapshot.active_ids)
+
+    def _attempt_internal_recovery(
+        self,
+        trigger: str,
+        *,
+        allow_closed: bool,
+        urgent: bool,
+    ) -> bool:
+        if self._stop_event.is_set():
+            return False
+        with self._state_lock:
+            if (
+                not self._enabled
+                or not self._clamshell.available
+                or not self._awake
+                or not self._pending_locked()
+                or (self._clamshell.closed and not allow_closed)
+            ):
+                return False
+
+        if urgent:
+            acquired = self._operation_lock.acquire(
+                timeout=self._URGENT_LOCK_TIMEOUT,
+            )
+        else:
+            acquired = self._operation_lock.acquire(blocking=False)
+        if not acquired:
+            self._log(
+                f"Display safety [{trigger}]: display operation busy; "
+                "pending recovery retained"
+            )
+            return False
+
+        verified = False
+        try:
+            timeout = self._URGENT_SNAPSHOT_TIMEOUT if urgent else 10.0
+            snapshot = self._query(trigger, timeout=timeout)
+            if snapshot is None:
+                return False
+            self._evaluate_snapshot(snapshot, trigger, schedule=False)
+            with self._state_lock:
+                if not self._pending_locked():
+                    self._recovery_timers.cancel()
+                    return False
+                targets = self._internal_target_ids_locked(snapshot)
+                summary = self._snapshot_summary_locked(snapshot)
+            if not targets:
+                self._log(
+                    f"Display safety [{trigger}]: no cached internal target; "
+                    f"{summary}"
+                )
+                return False
+
+            self._log(
+                f"Display safety [{trigger}]: enabling internal targets "
+                f"{targets}; {summary}"
+            )
+            attempted = False
+            cgs_accepted: list[int] = []
+            for display_id in targets:
+                attempted = True
+                try:
+                    if self._reenable is None:
+                        result = _reenable_displays(
+                            [display_id], fallback_timeout=timeout,
+                        )
+                    else:
+                        result = self._reenable([display_id])
+                except Exception as exc:
+                    self._log(
+                        f"Display safety [{trigger}]: target {display_id} "
+                        f"error: {exc}"
+                    )
+                    continue
+                self._log(
+                    f"Display safety [{trigger}]: target {display_id}: "
+                    f"{_format_reenable_result(result)}"
+                )
+                if result.success and result.method == "cgs":
+                    cgs_accepted.append(display_id)
+            if not attempted:
+                return False
+
+            verified = self._verify_internal_activation(trigger, timeout)
+            if not verified and cgs_accepted:
+                for display_id in cgs_accepted:
+                    try:
+                        if self._reenable_fallback is None:
+                            fallback = _reenable_displays_displayplacer(
+                                [display_id], timeout=timeout,
+                            )
+                        else:
+                            fallback = self._reenable_fallback([display_id])
+                    except Exception as exc:
+                        self._log(
+                            f"Display safety [{trigger}]: fallback target "
+                            f"{display_id} error: {exc}"
+                        )
+                        continue
+                    self._log(
+                        f"Display safety [{trigger}]: fallback target "
+                        f"{display_id}: {_format_reenable_result(fallback)}"
+                    )
+                verified = self._verify_internal_activation(
+                    f"{trigger}-fallback", timeout,
+                )
+        finally:
+            self._operation_lock.release()
+
+        if verified:
+            self._recovery_timers.cancel()
+            self._schedule_layout(trigger)
+        return verified
+
+    def _verify_internal_activation(
+        self,
+        trigger: str,
+        timeout: float,
+    ) -> bool:
+        verification = self._query(f"{trigger}-verify", timeout=timeout)
+        if verification is None:
+            return False
+        with self._state_lock:
+            self._observe_snapshot_locked(
+                verification,
+                f"{trigger}-verify",
+                allow_adopt=False,
+            )
+            verified = self._internal_active_locked(verification)
+            if verified:
+                self._clear_pending_locked("internal activation verified")
+                self._external_baseline.clear()
+                self._baseline_ids.clear()
+            summary = self._snapshot_summary_locked(verification)
+        self._log(
+            f"Display safety [{trigger}]: verification "
+            f"{'succeeded' if verified else 'failed'}; {summary}"
+        )
+        return verified
+
+    def note_display_reconfiguration(self, display_id: int, flags: int) -> None:
+        """Track display IDs affected by CoreGraphics reconfiguration."""
+        if not self.active or self._stop_event.is_set():
+            return
+        removed = bool(flags & (_CG_DISPLAY_REMOVE_FLAG | _CG_DISPLAY_DISABLED_FLAG))
+        added = bool(flags & _CG_DISPLAY_ADD_FLAG)
+        trigger = "display-disabled" if flags & _CG_DISPLAY_DISABLED_FLAG else (
+            "display-remove" if flags & _CG_DISPLAY_REMOVE_FLAG else "display-add"
+        )
+        arm = False
+        urgent = False
+        with self._state_lock:
+            display = self._last_snapshot_by_id.get(display_id)
+            internal = (
+                display_id in self._known_builtin_ids
+                or bool(display and self._is_builtin_locked(display))
+            )
+            intent = self._layout_intent
+            intentional = bool(
+                removed
+                and intent
+                and display_id in intent.expected_disabled_ids
+            )
+            identity = self._baseline_ids.get(display_id)
+            self._log(
+                f"Display safety [{trigger}]: callback id={display_id} "
+                f"flags=0x{flags:x} identity={identity} "
+                f"intentional={intentional}"
+            )
+            if intentional or (removed and internal):
+                return
+            if removed:
+                baseline_member = (
+                    identity in self._external_baseline
+                    if identity is not None else False
+                )
+                expected_enabled = bool(
+                    intent and display_id in intent.expected_enabled_ids
+                )
+                unknown_baseline_member = bool(
+                    display is None and self._external_baseline
+                )
+                if baseline_member or expected_enabled or unknown_baseline_member:
+                    self._arm_pending_locked("display-loss", trigger)
+                    self._layout_unexpected_loss = bool(intent)
+                    arm = True
+                    urgent = self._clamshell.closed
+
+        if arm:
+            self._schedule_recovery(
+                trigger, immediate=False, urgent=urgent,
+            )
+        if removed or added:
+            self.request_check(trigger)
+
+    def update_power_source(
+        self,
+        state: PowerSourceState,
+        trigger: str,
+    ) -> None:
+        """Apply a power-source event; AC-to-battery is an undock signal."""
+        if state == PowerSourceState.UNKNOWN:
+            self._log(f"Display safety [{trigger}]: power source unavailable")
+            return
+        arm = False
+        urgent = False
+        with self._state_lock:
+            previous = self._power_source
+            self._power_source = state
+            self._log(
+                f"Display safety [{trigger}]: power "
+                f"{previous.value}->{state.value}"
+            )
+            if (
+                previous == PowerSourceState.AC
+                and state == PowerSourceState.BATTERY
+                and self._external_baseline
+            ):
+                self._arm_pending_locked("power-loss", trigger)
+                self._layout_unexpected_loss = self._layout_intent is not None
+                arm = True
+                urgent = self._clamshell.closed
+
+        if arm:
+            self._schedule_recovery(
+                trigger, immediate=False, urgent=urgent,
+            )
+        self.request_check(trigger)
+
+    def update_clamshell(self, state: ClamshellState, trigger: str) -> None:
+        """Apply a lid-state event and route open/pending recovery."""
+        with self._state_lock:
+            self._clamshell = state
+            pending = self._pending_locked()
+        self._log(
+            f"Display safety [{trigger}]: clamshell "
+            f"lid={'closed' if state.closed else 'open'}, "
+            f"causes_sleep={state.causes_sleep}, pending={pending}"
+        )
+        if state.closed:
+            if pending:
+                self._schedule_recovery(trigger, immediate=True, urgent=True)
+        elif pending:
+            self._schedule_recovery(trigger, immediate=True)
+        else:
+            self.request_check(trigger)
+
+    def handle_wake(
+        self,
+        clamshell: ClamshellState | None,
+        power_source: PowerSourceState | None,
+    ) -> None:
+        """Refresh state first, then recover before normal wake layouts."""
+        arm_from_power = False
+        with self._state_lock:
+            self._awake = True
+            if clamshell is not None and clamshell.available:
+                self._clamshell = clamshell
+            if power_source not in (None, PowerSourceState.UNKNOWN):
+                previous = self._power_source
+                self._power_source = power_source
+                if (
+                    previous == PowerSourceState.AC
+                    and power_source == PowerSourceState.BATTERY
+                    and self._external_baseline
+                ):
+                    self._arm_pending_locked("power-loss", "wake-power")
+                    arm_from_power = True
+            pending = self._pending_locked()
+            state = self._clamshell
+            power = self._power_source
+        self._log(
+            "Display safety [wake]: refreshed "
+            f"lid={'closed' if state.closed else 'open'}, "
+            f"power={power.value}, pending={pending}, "
+            f"power_transition={arm_from_power}"
+        )
+        if pending and not state.closed:
+            self._schedule_recovery("wake", immediate=True)
+        else:
+            self.request_check("wake")
+
+    def begin_layout_operation(self, intent: DisplayOperationIntent) -> None:
+        """Declare display disables that are intentional for a layout."""
+        if not self.active or self._stop_event.is_set():
+            return
+        self._layout_settle_timers.cancel()
+        with self._state_lock:
+            self._layout_intent = intent
+            self._layout_unexpected_loss = False
+            self._layout_expected_enabled_external = Counter()
+            self._layout_expected_disabled_external = Counter()
+            expected_ids = (
+                intent.expected_enabled_ids | intent.expected_disabled_ids
+            )
+            needs_snapshot = not expected_ids.issubset(
+                self._last_snapshot_by_id,
+            )
+
+        if needs_snapshot:
+            snapshot = self._query(f"layout-begin:{intent.name}")
+            if snapshot is not None:
+                with self._state_lock:
+                    if self._layout_intent == intent:
+                        self._observe_snapshot_locked(
+                            snapshot,
+                            f"layout-begin:{intent.name}",
+                            allow_adopt=False,
+                        )
+
+        with self._state_lock:
+            if self._layout_intent != intent:
+                return
+            for display_id in intent.expected_enabled_ids:
+                display = self._last_snapshot_by_id.get(display_id)
+                if (
+                    display is not None
+                    and display.identity is not None
+                    and not self._is_builtin_locked(display)
+                ):
+                    self._layout_expected_enabled_external[
+                        display.identity
+                    ] += 1
+            for display_id in intent.expected_disabled_ids:
+                display = self._last_snapshot_by_id.get(display_id)
+                if (
+                    display is not None
+                    and display.identity is not None
+                    and not self._is_builtin_locked(display)
+                ):
+                    self._layout_expected_disabled_external[
+                        display.identity
+                    ] += 1
+        self._log(
+            f"Display safety [layout]: begin {intent.name}; "
+            f"enable={sorted(intent.expected_enabled_ids)}, "
+            f"disable={sorted(intent.expected_disabled_ids)}"
+        )
+
+    def finish_layout_operation(
+        self,
+        intent: DisplayOperationIntent,
+        result: int,
+    ) -> None:
+        """Settle and adopt a successful intentional layout topology."""
+        if self._stop_event.is_set():
+            return
+        with self._state_lock:
+            if self._layout_intent != intent:
+                return
+        self._log(
+            f"Display safety [layout]: finish {intent.name}; rc={result}"
+        )
+        self._layout_settle_timers.schedule(
+            (self._LAYOUT_SETTLE_DELAY,),
+            lambda: self._settle_layout_operation(intent, result),
+        )
+
+    def _settle_layout_operation(
+        self,
+        intent: DisplayOperationIntent,
+        result: int,
+    ) -> None:
+        snapshot = self._query(f"layout-settle:{intent.name}")
+        if snapshot is None:
+            with self._state_lock:
+                if self._layout_intent == intent:
+                    self._layout_intent = None
+                    self._layout_unexpected_loss = False
+                    self._layout_expected_enabled_external = Counter()
+                    self._layout_expected_disabled_external = Counter()
+            self.request_check("layout-settle-failed")
+            return
+        with self._state_lock:
+            if self._layout_intent != intent:
+                return
+            unexpected = self._layout_unexpected_loss
+            self._observe_snapshot_locked(
+                snapshot,
+                f"layout-settle:{intent.name}",
+                allow_adopt=False,
+            )
+            if result == 0 and not unexpected:
+                internal_expected_disabled = bool(
+                    intent.expected_disabled_ids & self._known_builtin_ids
+                )
+                if internal_expected_disabled:
+                    if self._internal_active_locked(snapshot):
+                        self._clear_pending_locked(
+                            "internal display remains active after layout"
+                        )
+                        self._external_baseline.clear()
+                        self._baseline_ids.clear()
+                    else:
+                        external, _external_ids = self._external_online_locked(
+                            snapshot,
+                        )
+                        requested = (
+                            self._layout_expected_enabled_external.copy()
+                        )
+                        if not requested:
+                            requested = (
+                                external
+                                - self._layout_expected_disabled_external
+                            )
+                        missing = requested - external
+                        if not requested or missing:
+                            unexpected = True
+                            self._arm_pending_locked(
+                                "display-loss",
+                                f"layout-settle:{intent.name}",
+                            )
+                            self._log(
+                                f"Display safety "
+                                f"[layout-settle:{intent.name}]: requested "
+                                "external topology not established; "
+                                f"requested="
+                                f"{self._format_identities(requested)}, "
+                                f"missing={self._format_identities(missing)}"
+                            )
+                        else:
+                            self._clear_pending_locked(
+                                "intentional layout established"
+                            )
+                            self._external_baseline.clear()
+                            self._baseline_ids.clear()
+                            self._adopt_baseline_locked(
+                                snapshot,
+                                f"layout-settle:{intent.name}",
+                                requested=requested,
+                                preferred_ids=intent.expected_enabled_ids,
+                            )
+                elif self._internal_active_locked(snapshot):
+                    self._clear_pending_locked(
+                        "intentional layout established"
+                    )
+                    self._external_baseline.clear()
+                    self._baseline_ids.clear()
+            self._layout_intent = None
+            self._layout_unexpected_loss = False
+            self._layout_expected_enabled_external = Counter()
+            self._layout_expected_disabled_external = Counter()
+        if result != 0 or unexpected:
+            self.request_check(f"layout-settle:{intent.name}")
+
+    def prepare_for_sleep(self) -> None:
+        """Make one bounded closed-lid attempt, preserving pending state."""
+        with self._state_lock:
+            should_recover = (
+                self._enabled
+                and self._clamshell.available
+                and self._clamshell.closed
+                and self._pending_locked()
+            )
+        if should_recover:
+            self._attempt_internal_recovery(
+                "system-will-sleep",
+                allow_closed=True,
+                urgent=True,
+            )
+        with self._state_lock:
+            self._awake = False
+        self._check_timers.cancel()
+        self._recovery_timers.cancel()
+
+
+def _route_display_reconfiguration(
+    display_id: int,
+    flags: int,
+    *,
+    suppressed: bool,
+    safety_controller: DisplaySafetyController | None,
+    schedule_layout: Callable[[], None],
+) -> None:
+    """Route CoreGraphics flags without configuring displays in the callback."""
+    if flags & _CG_DISPLAY_BEGIN_CONFIGURATION_FLAG:
+        return
+    if safety_controller is not None:
+        safety_controller.note_display_reconfiguration(display_id, flags)
+    if not suppressed and flags & (_CG_DISPLAY_ADD_FLAG | _CG_DISPLAY_REMOVE_FLAG):
+        schedule_layout()
 
 
 # ---------------------------------------------------------------------------
@@ -2118,9 +3546,6 @@ def daemon_main(
     options: Options,
 ) -> int:
     """Stay resident, re-applying the layout on wake and display changes."""
-    _log("Daemon starting — applying layout now")
-    _rc, initial_name = apply_current_layout(known_screens, device_set_layouts)
-
     if options.enable_menu_bar:
         import rumps
         from PyObjCTools import AppHelper
@@ -2140,6 +3565,8 @@ def daemon_main(
     c_void_p = ctypes.c_void_p
 
     _PowerCB = ctypes.CFUNCTYPE(None, c_void_p, c_uint32, c_uint32, c_void_p)
+    _PowerSourceCB = ctypes.CFUNCTYPE(None, c_void_p)
+    _InterestCB = ctypes.CFUNCTYPE(None, c_void_p, c_uint32, c_uint32, c_void_p)
     _ReconfigCB = ctypes.CFUNCTYPE(None, c_uint32, c_uint32, c_void_p)
 
     cg.CGDisplayRegisterReconfigurationCallback.argtypes = [_ReconfigCB, c_void_p]
@@ -2157,15 +3584,35 @@ def daemon_main(
 
     iokit.IOAllowPowerChange.argtypes = [c_uint32, ctypes.c_long]
     iokit.IOAllowPowerChange.restype = c_uint32
-
+    iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    iokit.IOServiceMatching.restype = c_void_p
+    iokit.IOServiceGetMatchingService.argtypes = [c_uint32, c_void_p]
+    iokit.IOServiceGetMatchingService.restype = c_uint32
+    iokit.IOServiceAddInterestNotification.argtypes = [
+        c_void_p, c_uint32, ctypes.c_char_p, _InterestCB,
+        c_void_p, ctypes.POINTER(c_uint32),
+    ]
+    iokit.IOServiceAddInterestNotification.restype = ctypes.c_int32
+    iokit.IODeregisterForSystemPower.argtypes = [ctypes.POINTER(c_uint32)]
+    iokit.IODeregisterForSystemPower.restype = ctypes.c_int32
+    iokit.IOServiceClose.argtypes = [c_uint32]
+    iokit.IOServiceClose.restype = ctypes.c_int32
+    iokit.IOObjectRelease.argtypes = [c_uint32]
+    iokit.IOObjectRelease.restype = ctypes.c_int32
+    iokit.IONotificationPortDestroy.argtypes = [c_void_p]
+    iokit.IONotificationPortDestroy.restype = None
     cf.CFRunLoopGetCurrent.argtypes = []
     cf.CFRunLoopGetCurrent.restype = c_void_p
     cf.CFRunLoopAddSource.argtypes = [c_void_p, c_void_p, c_void_p]
     cf.CFRunLoopAddSource.restype = None
+    cf.CFRunLoopRemoveSource.argtypes = [c_void_p, c_void_p, c_void_p]
+    cf.CFRunLoopRemoveSource.restype = None
     cf.CFRunLoopRun.argtypes = []
     cf.CFRunLoopRun.restype = None
     cf.CFRunLoopStop.argtypes = [c_void_p]
     cf.CFRunLoopStop.restype = None
+    cf.CFRelease.argtypes = [c_void_p]
+    cf.CFRelease.restype = None
 
     kIOMessageCanSystemSleep = 0xE0000270
     kIOMessageSystemWillSleep = 0xE0000280
@@ -2173,18 +3620,16 @@ def daemon_main(
 
     kCFRunLoopDefaultMode = c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
 
-    apply_lock = threading.Lock()
-    pending: list[threading.Timer] = []
+    operation_lock = threading.Lock()
+    layout_timers = _TimerBatch()
+    unsuppress_timer = _TimerBatch()
     _suppress_reconfig = True
-
-    def cancel_pending() -> None:
-        for t in pending:
-            t.cancel()
-        pending.clear()
 
     # -- Menu bar app (only instantiated when enabled) --
     _menu_bar_active = options.enable_menu_bar
     app: object = None
+    global_key_monitor: object = None
+    safety_controller: DisplaySafetyController | None = None
 
     def _notify(title: str, subtitle: str) -> None:
         """Send a macOS notification via osascript (works on all macOS versions)."""
@@ -2242,24 +3687,42 @@ def daemon_main(
                 AppHelper.callAfter(self._finish_operation)
 
             def _on_layout_click(self, sender):
-                if not apply_lock.acquire(blocking=False):
+                if not operation_lock.acquire(blocking=False):
                     return
-                layout = next((l for l in self._all_layouts() if l.name == sender.title), None)
+                layout = next(
+                    (
+                        candidate for candidate in self._all_layouts()
+                        if candidate.name == sender.title
+                    ),
+                    None,
+                )
                 if not layout:
-                    apply_lock.release()
+                    operation_lock.release()
                     return
                 self.title = _BUSY_TITLE
                 t = threading.Thread(target=self._do_apply, args=(layout,), daemon=True)
                 t.start()
 
             def _do_apply(self, layout):
+                nonlocal _suppress_reconfig
+                _suppress_reconfig = True
                 try:
                     displays = parse_displays(run_displayplacer_list())
                     displays.extend(_disabled_display_objects(fresh=True))
                     hw_map = build_hw_info_map()
                     matched, _ = match_displays(displays, known_screens, hw_map)
                     if matched:
-                        rc = _apply_layout(layout, matched, known_screens)
+                        intent = _layout_operation_intent(layout, matched)
+                        if safety_controller is not None:
+                            safety_controller.begin_layout_operation(intent)
+                        rc = 1
+                        try:
+                            rc = _apply_layout(layout, matched, known_screens)
+                        finally:
+                            if safety_controller is not None:
+                                safety_controller.finish_layout_operation(
+                                    intent, rc,
+                                )
                         if rc == 0:
                             self._current_layout_name = layout.name
                             _log(f"Menu: applied {layout.name}")
@@ -2274,11 +3737,12 @@ def daemon_main(
                     _log(f"Menu: error applying layout: {exc}")
                     _notify("Layout failed", str(exc))
                 finally:
-                    apply_lock.release()
+                    operation_lock.release()
+                    unsuppress_timer.schedule((5.0,), _unsuppress)
                     self._schedule_finish()
 
             def _on_reset_click(self, sender):
-                if not apply_lock.acquire(blocking=False):
+                if not operation_lock.acquire(blocking=False):
                     return
                 self.title = _BUSY_TITLE
                 t = threading.Thread(target=self._do_reset, daemon=True)
@@ -2293,6 +3757,8 @@ def daemon_main(
                         result = _reenable_displays(ids)
                         _log(f"Menu: {_format_reenable_result(result)}")
                         if result.success:
+                            if safety_controller is not None:
+                                safety_controller.request_check("menu-reset")
                             _notify(
                                 "Displays reset",
                                 f"Re-enabled {len(ids)} display(s)",
@@ -2309,9 +3775,308 @@ def daemon_main(
                     _log(f"Menu: reset error: {exc}")
                     _notify("Reset failed", str(exc))
                 finally:
-                    apply_lock.release()
+                    operation_lock.release()
                     self._schedule_finish()
 
+    def _unsuppress() -> None:
+        nonlocal _suppress_reconfig
+        _suppress_reconfig = False
+        _log("Reconfig listener re-enabled (suppression lifted)")
+
+    def safe_apply(reason: str) -> None:
+        nonlocal _suppress_reconfig
+        if not operation_lock.acquire(blocking=False):
+            _log(f"Layout apply [{reason}] already in progress — skipping attempt")
+            return
+        _suppress_reconfig = True
+        try:
+            _rc, name = apply_current_layout(
+                known_screens,
+                device_set_layouts,
+                begin_operation=(
+                    safety_controller.begin_layout_operation
+                    if safety_controller is not None else None
+                ),
+                finish_operation=(
+                    safety_controller.finish_layout_operation
+                    if safety_controller is not None else None
+                ),
+            )
+            if _menu_bar_active and app is not None:
+                if name:
+                    app._current_layout_name = name  # type: ignore[union-attr]
+                app.schedule_menu_rebuild()  # type: ignore[union-attr]
+        except Exception as exc:
+            _log(f"Error: {exc}")
+        finally:
+            operation_lock.release()
+            unsuppress_timer.schedule((5.0,), _unsuppress)
+
+    def schedule_layout_attempts(delays: tuple[int, ...], reason: str) -> None:
+        delay_text = "/".join(str(delay) for delay in delays)
+        _log(f"{reason} — scheduling layout at {delay_text}s")
+        layout_timers.schedule(delays, lambda: safe_apply(reason))
+
+    root_port = c_uint32()
+    notify_port = c_void_p()
+    power_notifier = c_uint32()
+    clamshell_notifier = c_uint32()
+    root_service = c_uint32()
+    source = c_void_p()
+    power_source_source = c_void_p()
+    run_loop = c_void_p()
+    power_registered = False
+    source_added = False
+    power_source_added = False
+    clamshell_registered = False
+    cg_registered = False
+    cleaned_up = False
+
+    @_PowerCB
+    def _power_cb(_refcon, _service, msg_type, msg_arg):
+        if msg_type == kIOMessageSystemHasPoweredOn:
+            _log("Wake detected")
+            if safety_controller is not None:
+                latest_state: ClamshellState | None = None
+                if root_service.value:
+                    read_state = _read_clamshell_state(
+                        iokit, cf, root_service.value,
+                    )
+                    if read_state.available:
+                        latest_state = read_state
+                latest_power = _read_power_source_state(iokit, cf)
+                safety_controller.handle_wake(latest_state, latest_power)
+            schedule_layout_attempts(_WAKE_DELAYS, "Wake detected")
+            return
+
+        if msg_type == kIOMessageCanSystemSleep:
+            layout_timers.cancel()
+            iokit.IOAllowPowerChange(root_port.value, int(msg_arg or 0))
+            return
+
+        if msg_type == kIOMessageSystemWillSleep:
+            layout_timers.cancel()
+
+            def prepare_for_sleep() -> None:
+                if safety_controller is not None:
+                    if root_service.value:
+                        latest_state = _read_clamshell_state(
+                            iokit, cf, root_service.value,
+                        )
+                        if latest_state.available:
+                            safety_controller.update_clamshell(
+                                latest_state, "system-will-sleep-state",
+                            )
+                    safety_controller.update_power_source(
+                        _read_power_source_state(iokit, cf),
+                        "system-will-sleep-power",
+                    )
+                    safety_controller.prepare_for_sleep()
+
+            _handle_system_will_sleep(
+                prepare_for_sleep,
+                lambda: iokit.IOAllowPowerChange(
+                    root_port.value, int(msg_arg or 0),
+                ),
+            )
+
+    @_InterestCB
+    def _clamshell_cb(_refcon, _service, msg_type, msg_arg):
+        if (
+            msg_type == _IOPM_MESSAGE_CLAMSHELL_STATE_CHANGE
+            and safety_controller is not None
+        ):
+            state = _decode_clamshell_message(int(msg_arg or 0))
+            safety_controller.update_clamshell(state, "clamshell-change")
+
+    @_PowerSourceCB
+    def _power_source_cb(_context):
+        if safety_controller is not None:
+            safety_controller.update_power_source(
+                _read_power_source_state(iokit, cf),
+                "power-source-change",
+            )
+
+    @_ReconfigCB
+    def _reconfig_cb(display, flags, _user_info):
+        _route_display_reconfiguration(
+            int(display),
+            flags,
+            suppressed=_suppress_reconfig,
+            safety_controller=safety_controller,
+            schedule_layout=lambda: schedule_layout_attempts(
+                _RECONFIG_DELAYS,
+                "Display reconfiguration detected",
+            ),
+        )
+
+    def _cleanup() -> None:
+        nonlocal cleaned_up, power_registered, source_added
+        nonlocal power_source_added, clamshell_registered, cg_registered
+        nonlocal global_key_monitor
+        if cleaned_up:
+            return
+        cleaned_up = True
+        _log("Shutting down")
+        if safety_controller is not None:
+            safety_controller.stop()
+        layout_timers.cancel()
+        unsuppress_timer.cancel()
+        if cg_registered:
+            cg.CGDisplayRemoveReconfigurationCallback(_reconfig_cb, None)
+            cg_registered = False
+        if clamshell_registered and clamshell_notifier.value:
+            iokit.IOObjectRelease(clamshell_notifier.value)
+            clamshell_notifier.value = 0
+            clamshell_registered = False
+        if root_service.value:
+            iokit.IOObjectRelease(root_service.value)
+            root_service.value = 0
+        if power_source_added and run_loop.value and power_source_source.value:
+            cf.CFRunLoopRemoveSource(
+                run_loop, power_source_source, kCFRunLoopDefaultMode,
+            )
+            power_source_added = False
+        if power_source_source.value:
+            cf.CFRelease(power_source_source)
+            power_source_source.value = None
+        if source_added and run_loop.value and source.value:
+            cf.CFRunLoopRemoveSource(
+                run_loop, source, kCFRunLoopDefaultMode,
+            )
+            source_added = False
+        if power_registered:
+            iokit.IODeregisterForSystemPower(ctypes.byref(power_notifier))
+            power_registered = False
+        if root_port.value:
+            iokit.IOServiceClose(root_port.value)
+            root_port.value = 0
+        if notify_port.value:
+            iokit.IONotificationPortDestroy(notify_port)
+            notify_port.value = None
+        if _menu_bar_active and global_key_monitor is not None:
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(global_key_monitor)
+            except Exception:
+                pass
+            global_key_monitor = None
+
+    root_port.value = iokit.IORegisterForSystemPower(
+        None, ctypes.byref(notify_port), _power_cb, ctypes.byref(power_notifier),
+    )
+    if root_port.value == 0:
+        _log("Error: IORegisterForSystemPower failed")
+        return 1
+    power_registered = True
+
+    source.value = iokit.IONotificationPortGetRunLoopSource(notify_port)
+    run_loop.value = cf.CFRunLoopGetCurrent()
+    if not source.value or not run_loop.value:
+        _log("Error: failed to attach IOKit notification run-loop source")
+        _cleanup()
+        return 1
+    cf.CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode)
+    source_added = True
+
+    clamshell_state = ClamshellState(False)
+    if options.enable_display_safety:
+        matching = iokit.IOServiceMatching(b"IOPMrootDomain")
+        if matching:
+            root_service.value = iokit.IOServiceGetMatchingService(0, matching)
+        if root_service.value:
+            clamshell_state = _read_clamshell_state(
+                iokit, cf, root_service.value,
+            )
+    initial_power_source = _read_power_source_state(iokit, cf)
+
+    safety_controller = DisplaySafetyController(
+        enabled=options.enable_display_safety,
+        watchdog_interval=options.display_watchdog_interval,
+        clamshell=clamshell_state,
+        operation_lock=operation_lock,
+        power_source=initial_power_source,
+        schedule_layout=lambda trigger: schedule_layout_attempts(
+            _RECONFIG_DELAYS,
+            f"Display safety recovery [{trigger}]",
+        ),
+    )
+
+    if (
+        options.enable_display_safety
+        and clamshell_state.available
+        and root_service.value
+    ):
+        rc = iokit.IOServiceAddInterestNotification(
+            notify_port,
+            root_service.value,
+            b"IOGeneralInterest",
+            _clamshell_cb,
+            None,
+            ctypes.byref(clamshell_notifier),
+        )
+        if rc == 0:
+            clamshell_registered = True
+        else:
+            _log(
+                "Warning: clamshell event registration failed; "
+                "watchdog and sleep/wake recovery remain active"
+            )
+
+    if options.enable_display_safety and clamshell_state.available:
+        try:
+            create_power_source = iokit.IOPSNotificationCreateRunLoopSource
+            create_power_source.argtypes = [_PowerSourceCB, c_void_p]
+            create_power_source.restype = c_void_p
+            power_source_source.value = create_power_source(
+                _power_source_cb, None,
+            )
+            if power_source_source.value:
+                cf.CFRunLoopAddSource(
+                    run_loop,
+                    power_source_source,
+                    kCFRunLoopDefaultMode,
+                )
+                power_source_added = True
+            else:
+                _log(
+                    "Warning: power-source listener unavailable; "
+                    "display and lid recovery remain active"
+                )
+        except (
+            AttributeError,
+            OSError,
+            TypeError,
+            ctypes.ArgumentError,
+        ) as exc:
+            _log(
+                "Warning: power-source listener unavailable "
+                f"({exc}); display and lid recovery remain active"
+            )
+
+    if cg.CGDisplayRegisterReconfigurationCallback(_reconfig_cb, None) != 0:
+        _log("Warning: CGDisplayRegisterReconfigurationCallback failed")
+    else:
+        cg_registered = True
+
+    # Listeners are registered before startup recovery and the initial layout.
+    safety_controller.start()
+    _log("Daemon starting — applying layout now")
+    initial_name: str | None = None
+    operation_lock.acquire()
+    try:
+        _rc, initial_name = apply_current_layout(
+            known_screens,
+            device_set_layouts,
+            begin_operation=safety_controller.begin_layout_operation,
+            finish_operation=safety_controller.finish_layout_operation,
+        )
+    except Exception as exc:
+        _log(f"Initial layout error: {exc}")
+    finally:
+        operation_lock.release()
+
+    if options.enable_menu_bar:
         app = LayoutMenuBarApp(initial_name)
 
         # Global hotkey: Ctrl+Option+Cmd+R → reset displays
@@ -2320,98 +4085,18 @@ def daemon_main(
         _HOTKEY_R_KEYCODE = 15
 
         def _global_key_handler(event):
-            if (event.keyCode() == _HOTKEY_R_KEYCODE
-                    and (event.modifierFlags() & _HOTKEY_MASK_FLAGS) == _HOTKEY_MASK_FLAGS):
-                app._on_reset_click(None)
+            if (
+                event.keyCode() == _HOTKEY_R_KEYCODE
+                and (
+                    event.modifierFlags() & _HOTKEY_MASK_FLAGS
+                ) == _HOTKEY_MASK_FLAGS
+            ):
+                app._on_reset_click(None)  # type: ignore[union-attr]
 
-        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+        global_key_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             1 << 10,  # NSEventMaskKeyDown
             _global_key_handler,
         )
-
-    def _unsuppress() -> None:
-        nonlocal _suppress_reconfig
-        _suppress_reconfig = False
-        _log("Reconfig listener re-enabled (suppression lifted)")
-
-    def safe_apply() -> None:
-        nonlocal _suppress_reconfig
-        if not apply_lock.acquire(blocking=False):
-            _log("Layout apply already in progress — skipping")
-            return
-        _suppress_reconfig = True
-        cancel_pending()
-        try:
-            _rc, name = apply_current_layout(known_screens, device_set_layouts)
-            if _menu_bar_active:
-                if name:
-                    app._current_layout_name = name  # type: ignore[union-attr]
-                app.schedule_menu_rebuild()  # type: ignore[union-attr]
-        except Exception as exc:
-            _log(f"Error: {exc}")
-        finally:
-            apply_lock.release()
-            t = threading.Timer(5.0, _unsuppress)
-            t.daemon = True
-            t.start()
-
-    root_port = c_uint32()
-    notify_port = c_void_p()
-    notifier = c_uint32()
-
-    @_PowerCB
-    def _power_cb(_refcon, _service, msg_type, msg_arg):
-        if msg_type == kIOMessageSystemHasPoweredOn:
-            _log("Wake detected — scheduling layout at 5/10/15s")
-            cancel_pending()
-            for delay in _WAKE_DELAYS:
-                t = threading.Timer(delay, safe_apply)
-                t.daemon = True
-                t.start()
-                pending.append(t)
-        elif msg_type in (kIOMessageCanSystemSleep, kIOMessageSystemWillSleep):
-            cancel_pending()
-            iokit.IOAllowPowerChange(
-                root_port.value, msg_arg if msg_arg is not None else 0,
-            )
-
-    kCGDisplayBeginConfigurationFlag = 1 << 0
-    kCGDisplayAddFlag = 1 << 4
-    kCGDisplayRemoveFlag = 1 << 5
-
-    @_ReconfigCB
-    def _reconfig_cb(_display, flags, _user_info):
-        if flags & kCGDisplayBeginConfigurationFlag:
-            return
-        if _suppress_reconfig:
-            return
-        if flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag):
-            _log("Display reconfiguration detected — scheduling layout at 2/5/10s")
-            cancel_pending()
-            for delay in _RECONFIG_DELAYS:
-                t = threading.Timer(delay, safe_apply)
-                t.daemon = True
-                t.start()
-                pending.append(t)
-
-    root_port.value = iokit.IORegisterForSystemPower(
-        None, ctypes.byref(notify_port), _power_cb, ctypes.byref(notifier),
-    )
-    if root_port.value == 0:
-        _log("Error: IORegisterForSystemPower failed")
-        return 1
-
-    source = iokit.IONotificationPortGetRunLoopSource(notify_port)
-    run_loop = cf.CFRunLoopGetCurrent()
-    cf.CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode)
-
-    if cg.CGDisplayRegisterReconfigurationCallback(_reconfig_cb, None) != 0:
-        _log("Warning: CGDisplayRegisterReconfigurationCallback failed")
-
-    def _cleanup():
-        _log("Shutting down")
-        cancel_pending()
-        cg.CGDisplayRemoveReconfigurationCallback(_reconfig_cb, None)
 
     if _menu_bar_active:
         from PyObjCTools import MachSignals as _ms
@@ -2431,15 +4116,17 @@ def daemon_main(
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-    _log("Listening for wake and display events")
-    t = threading.Timer(5.0, _unsuppress)
-    t.daemon = True
-    t.start()
+    _log(
+        "Listening for wake, clamshell, display, power-source, "
+        "and watchdog events"
+    )
+    unsuppress_timer.schedule((5.0,), _unsuppress)
     if _menu_bar_active:
         _log("Menu bar active")
         app.run()  # type: ignore[union-attr]
     else:
         cf.CFRunLoopRun()
+    _cleanup()
     _log("Daemon stopped")
     return 0
 

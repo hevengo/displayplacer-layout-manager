@@ -18,10 +18,19 @@
 #
 #   enable-menu-bar - when true, the daemon shows a macOS menu bar icon
 #                     that lists all layouts for quick switching (default: false)
+#   enable-display-safety - enable the MacBook panel after a sustained external
+#                           baseline loss or AC-to-battery undock signal. Automatic
+#                           recovery is internal-only; even partial monitor loss
+#                           triggers it under the maximum-safety policy. Intentional
+#                           layout disables are exempt. (default: true)
+#   display-watchdog-interval - seconds between fallback safety checks;
+#                               0 disables only the watchdog (default: 30)
 # -----------------------------------------------------------------------------
 
 options:
   enable-menu-bar: false
+  enable-display-safety: true
+  display-watchdog-interval: 30
 
 
 # -----------------------------------------------------------------------------
